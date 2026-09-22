@@ -1,0 +1,338 @@
+openapi: 3.0.3
+info:
+  title: Farmer-to-Retailer Marketplace API
+  version: 0.1.0
+  description: >
+    Starter OpenAPI document for the V1 modular monolith. This is a skeleton covering
+    the primary resources and a representative endpoint per module — see docs/api-spec.md
+    for the full endpoint catalogue. Fill out remaining paths/schemas during the
+    Foundation phase as each module is implemented.
+servers:
+  - url: /api/v1
+tags:
+  - name: auth
+  - name: users
+  - name: catalog
+  - name: negotiation
+  - name: orders
+  - name: payments
+  - name: disputes
+  - name: admin
+
+paths:
+  /auth/otp/request:
+    post:
+      tags: [auth]
+      summary: Request an OTP for signup or login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, purpose]
+              properties:
+                phone: { type: string, example: "+919812345678" }
+                purpose: { type: string, enum: [SIGNUP, LOGIN] }
+                role: { type: string, enum: [FARMER, RETAILER] }
+      responses:
+        "200":
+          description: Challenge created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challengeId: { type: string, format: uuid }
+                  expiresAt: { type: string, format: date-time }
+
+  /auth/otp/verify:
+    post:
+      tags: [auth]
+      summary: Verify an OTP and receive tokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challengeId, otp]
+              properties:
+                challengeId: { type: string, format: uuid }
+                otp: { type: string, example: "123456" }
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken: { type: string }
+                  refreshToken: { type: string }
+                  user: { $ref: "#/components/schemas/User" }
+
+  /listings:
+    get:
+      tags: [catalog]
+      summary: Search/browse active listings (matching engine)
+      parameters:
+        - { name: categoryId, in: query, schema: { type: string, format: uuid } }
+        - { name: cropName, in: query, schema: { type: string } }
+        - { name: minPrice, in: query, schema: { type: number } }
+        - { name: maxPrice, in: query, schema: { type: number } }
+        - { name: lat, in: query, schema: { type: number } }
+        - { name: lng, in: query, schema: { type: number } }
+        - { name: radiusKm, in: query, schema: { type: number } }
+        - { name: sort, in: query, schema: { type: string, enum: [distance, price, newest] } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+      responses:
+        "200":
+          description: Paginated listings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Listing" }
+                  total: { type: integer }
+                  page: { type: integer }
+    post:
+      tags: [catalog]
+      summary: Create a listing (verified farmer only)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateListingDto" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Listing" }
+
+  /listings/{id}/negotiations:
+    post:
+      tags: [negotiation]
+      summary: Open a negotiation on a listing (retailer)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pricePerUnit, quantity]
+              properties:
+                pricePerUnit: { type: number }
+                quantity: { type: number }
+                message: { type: string }
+      responses:
+        "201":
+          description: Negotiation opened
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Negotiation" }
+
+  /negotiations/{id}/accept:
+    post:
+      tags: [negotiation]
+      summary: Accept the current terms — creates an order
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Negotiation accepted; order created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  negotiation: { $ref: "#/components/schemas/Negotiation" }
+                  order: { $ref: "#/components/schemas/Order" }
+
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Get an order (participant only)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+
+  /orders/{id}/pickup/confirm:
+    post:
+      tags: [orders]
+      summary: Retailer confirms handover using the OTP the farmer read out
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [otp]
+              properties:
+                otp: { type: string }
+      responses:
+        "200":
+          description: Order moved to PICKED_UP; payout initiated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+
+  /webhooks/payments/{provider}:
+    post:
+      tags: [payments]
+      summary: Gateway webhook receiver (Razorpay/Cashfree/Mock)
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [mock, razorpay, cashfree] } }
+      responses:
+        "200": { description: Acknowledged }
+
+  /orders/{id}/disputes:
+    post:
+      tags: [disputes]
+      summary: Raise a dispute on an order
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category, description]
+              properties:
+                category: { type: string, enum: [QUALITY, QUANTITY, NO_SHOW, PAYMENT, OTHER] }
+                description: { type: string }
+                evidenceS3Keys:
+                  type: array
+                  items: { type: string }
+      responses:
+        "201":
+          description: Dispute opened
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dispute" }
+
+  /admin/metrics/overview:
+    get:
+      tags: [admin]
+      summary: Platform overview metrics
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  gmv: { type: number }
+                  commissionEarned: { type: number }
+                  activeFarmers: { type: integer }
+                  activeRetailers: { type: integer }
+                  ordersByStatus:
+                    type: object
+                    additionalProperties: { type: integer }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string }
+        role: { type: string, enum: [FARMER, RETAILER, ADMIN] }
+        status: { type: string, enum: [PENDING_VERIFICATION, ACTIVE, SUSPENDED] }
+
+    CreateListingDto:
+      type: object
+      required: [categoryId, cropName, quantityAvailable, unit, pricePerUnit]
+      properties:
+        categoryId: { type: string, format: uuid }
+        cropName: { type: string }
+        variety: { type: string }
+        quantityAvailable: { type: number }
+        unit: { type: string, enum: [KG, QUINTAL, DOZEN, UNIT] }
+        pricePerUnit: { type: number }
+        qualityGrade: { type: string, enum: [A, B, C] }
+        harvestDate: { type: string, format: date }
+        availableFrom: { type: string, format: date-time }
+        availableUntil: { type: string, format: date-time }
+        pickupAddress: { type: string }
+
+    Listing:
+      allOf:
+        - $ref: "#/components/schemas/CreateListingDto"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            farmerId: { type: string, format: uuid }
+            status: { type: string, enum: [DRAFT, ACTIVE, PAUSED, SOLD_OUT, EXPIRED, REMOVED] }
+            createdAt: { type: string, format: date-time }
+
+    Negotiation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        listingId: { type: string, format: uuid }
+        farmerId: { type: string, format: uuid }
+        retailerId: { type: string, format: uuid }
+        status: { type: string, enum: [OPEN, ACCEPTED, REJECTED, EXPIRED, CANCELLED] }
+        finalPricePerUnit: { type: number, nullable: true }
+        finalQuantity: { type: number, nullable: true }
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        negotiationId: { type: string, format: uuid }
+        farmerId: { type: string, format: uuid }
+        retailerId: { type: string, format: uuid }
+        quantity: { type: number }
+        pricePerUnit: { type: number }
+        subtotalAmount: { type: number }
+        commissionAmount: { type: number }
+        payoutAmount: { type: number }
+        status:
+          type: string
+          enum:
+            [
+              PENDING_PAYMENT, PAYMENT_FAILED, CONFIRMED, PICKUP_SCHEDULED,
+              READY_FOR_PICKUP, PICKED_UP, COMPLETED, CANCELLED, DISPUTED,
+              REFUNDED, PARTIALLY_REFUNDED,
+            ]
+        pickupScheduledAt: { type: string, format: date-time, nullable: true }
+        pickupConfirmedAt: { type: string, format: date-time, nullable: true }
+
+    Dispute:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        category: { type: string, enum: [QUALITY, QUANTITY, NO_SHOW, PAYMENT, OTHER] }
+        status:
+          type: string
+          enum: [OPEN, UNDER_REVIEW, RESOLVED_REFUND, RESOLVED_PARTIAL_REFUND, RESOLVED_NO_ACTION, REJECTED]
