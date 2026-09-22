@@ -373,16 +373,22 @@ components:
 
     Payout:
       type: object
-      description: The gateway's held split-transfer record for this order's farmer share. See ADR-0005.
+      description: >
+        The gateway's held split-transfer record for this order's farmer share. See ADR-0005 and
+        docs/decisions/provider-capabilities-payment-split.md. released and settled are separate,
+        provider-confirmed events with a real gap between them — an order is COMPLETED only once settledAt
+        is set, not on releasedAt alone.
       properties:
         id: { type: string, format: uuid }
         orderId: { type: string, format: uuid }
         amount: { type: number }
         onHold: { type: boolean }
-        holdReleaseAt: { type: string, format: date-time, nullable: true }
-        releasedAt: { type: string, format: date-time, nullable: true }
+        holdReleaseAt: { type: string, format: date-time, nullable: true, description: "When we intend to trigger release" }
+        holdCeilingAt: { type: string, format: date-time, nullable: true, description: "Outer bound given to the provider at creation (required/capped at 45 days for Cashfree; informational only for Razorpay)" }
+        releasedAt: { type: string, format: date-time, nullable: true, description: "Release triggered — not proof of funds landed" }
+        settledAt: { type: string, format: date-time, nullable: true, description: "Provider-confirmed funds landed in the farmer's linked account" }
         reversedAmount: { type: number }
-        status: { type: string, enum: [ON_HOLD, RELEASED, REVERSED, PARTIALLY_REVERSED, FAILED] }
+        status: { type: string, enum: [ON_HOLD, RELEASED, SETTLED, REVERSED, PARTIALLY_REVERSED, FAILED] }
 
     Dispute:
       type: object

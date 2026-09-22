@@ -85,7 +85,7 @@ your own open offer).
 |---|---|---|---|---|
 | POST | `/orders/:id/payment-intent` | bearer, owning `RETAILER` | — | `{ provider, providerOrderId, clientPayload }` — creates the gateway's split-payment order with the farmer's `on_hold` transfer already configured for `payoutAmount` (see ADR-0005); `clientPayload` is what the frontend hands to the gateway's checkout SDK |
 | GET | `/orders/:id/payment` | bearer, participant | — | `Payment` (includes reconciliation fields for admin; participant view omits internal reconciliation status) |
-| GET | `/orders/:id/payout` | bearer, participant | — | `Payout` — the held-transfer record: `onHold`, `holdReleaseAt`, `status`, and (once released) `releasedAt` |
+| GET | `/orders/:id/payout` | bearer, participant | — | `Payout` — the held-transfer record: `onHold`, `holdReleaseAt`, `holdCeilingAt`, `status` (`ON_HOLD`\|`RELEASED`\|`SETTLED`\|`REVERSED`\|`PARTIALLY_REVERSED`\|`FAILED`), and, once each happens, `releasedAt`/`settledAt`. **Note**: `released` and `settled` are genuinely separate events per provider research (`docs/decisions/provider-capabilities-payment-split.md`) — the order isn't `COMPLETED` until `settledAt` is set |
 | POST | `/webhooks/payments/:provider` | **none** (HMAC signature verified from raw body) | raw gateway payload | `200` (always, per gateway convention) |
 
 ## Disputes

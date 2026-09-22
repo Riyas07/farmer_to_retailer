@@ -45,14 +45,19 @@ flip.
 
 Created the instant a negotiation is `ACCEPTED`. This is the core trust-and-money state machine.
 
-**Design rule that shapes this diagram**: an order can only be `COMPLETED` once its payout transfer has been
-**irreversibly released** at the gateway (see `docs/decisions/ADR-0005-payment-payout-model.md`). Because of
-that, `DISPUTED` must always be reachable *before* `COMPLETED` and never after — a dispute raised after
-`COMPLETED` would be asking to reverse money that has already, genuinely, left the system's control. The fix
-versus an earlier draft of this doc is a **payout hold window**: pickup confirmation does not itself release the
-transfer. It starts a hold window (`orders.payout_release_at`); only once that window elapses with no dispute
-open does the system release the transfer and move the order to `COMPLETED`. `DISPUTED` is reachable any time up
-through that window, and is **not** reachable from `COMPLETED`.
+**Design rule that shapes this diagram**: an order can only be `COMPLETED` once its payout transfer is
+**confirmed settled** at the gateway — not merely released. Provider research
+(`docs/decisions/provider-capabilities-payment-split.md`) confirms "release" (hold lifted) and "settled" (funds
+actually landed in the farmer's bank) are two distinct, separately-signalled events for both Razorpay and
+Cashfree, with a real gap between them (Razorpay: "by the next working day"). An earlier draft of this doc
+treated them as one atomic step — corrected here. Because `COMPLETED` means "genuinely, confirmed paid,"
+`DISPUTED` must always be reachable *before* `COMPLETED` and never after. The mechanism: pickup confirmation does
+not itself release the transfer. It starts a hold window (`orders.payout_release_at`); once that window elapses
+with no dispute open, the system triggers release, and once the gateway *confirms settlement* (a later, separate
+signal — see `payouts.released_at` vs. `payouts.settled_at` in `docs/erd.md`), the order moves to `COMPLETED`.
+`DISPUTED` is reachable any time up through settlement confirmation, and is **not** reachable from `COMPLETED`.
+This narrows, but — per the provider research — does not fully eliminate, the residual window between release
+and settlement; that's an accepted, named risk, not a solved one.
 
 ```mermaid
 stateDiagram-v2
@@ -65,7 +70,8 @@ stateDiagram-v2
     CONFIRMED --> PICKUP_SCHEDULED: pickup date/time agreed
     PICKUP_SCHEDULED --> READY_FOR_PICKUP: farmer marks produce ready\n(pickup handover code generated)
     READY_FOR_PICKUP --> PICKED_UP: retailer confirms handover code\npayout_release_at = now + hold window (e.g. 48h)
-    PICKED_UP --> COMPLETED: hold window elapses, no open dispute\ntransfer released to farmer's linked account
+    PICKED_UP --> PICKED_UP: hold window elapses, no open dispute\ntransfer release triggered (payouts.status = RELEASED)
+    PICKED_UP --> COMPLETED: gateway confirms settlement\n(payouts.status = SETTLED)
 
     CONFIRMED --> CANCELLED: mutual cancel / admin override (pre-pickup)\ntransfer cancelled, payment refunded
     PICKUP_SCHEDULED --> CANCELLED: mutual cancel / admin override (pre-pickup)\ntransfer cancelled, payment refunded
@@ -73,7 +79,7 @@ stateDiagram-v2
     CONFIRMED --> DISPUTED: dispute raised
     PICKUP_SCHEDULED --> DISPUTED: dispute raised
     READY_FOR_PICKUP --> DISPUTED: no-show past pickup deadline (system) or dispute raised
-    PICKED_UP --> DISPUTED: dispute raised (only reachable before payout_release_at)
+    PICKED_UP --> DISPUTED: dispute raised (reachable until settlement is confirmed — see note above)
 
     DISPUTED --> RESOLVED_RESUME: admin resolves — no action, resume flow
     DISPUTED --> REFUNDED: admin resolves — full refund; transfer reversed, payment refunded
@@ -108,24 +114,33 @@ path in V1 — see the "why no post-completion disputes" note below.
 | `CONFIRMED` | Pickup slot agreed | `PICKUP_SCHEDULED` | farmer or retailer (either proposes, other confirms — simple mutual-agreement field, not a sub-workflow) | `pickup_scheduled_at` set; notify both |
 | `PICKUP_SCHEDULED` | Farmer marks ready | `READY_FOR_PICKUP` | farmer | system generates a **pickup handover code** (`pickup_handover_codes` — a mechanism entirely separate from login/signup OTP, see below) and sends the plaintext code to the **farmer only**; notify retailer "ready for pickup" |
 | `READY_FOR_PICKUP` | Retailer enters the handover code (read aloud by farmer at physical handover) | `PICKED_UP` | retailer | `pickup_confirmed_at` set; `payout_release_at = pickup_confirmed_at + hold window` (default 48h, admin-configurable); `order_status_history` records who confirmed; `PickupConfirmed` event |
-| `PICKED_UP` | `payout_release_at` passes, no open dispute | `COMPLETED` | system (scheduled job) | gateway transfer released; `payouts.status = SETTLED`, `released_at` set; `PayoutProcessed` event → notify farmer |
+| `PICKED_UP` | `payout_release_at` passes, no open dispute | `PICKED_UP` (unchanged) | system (scheduled job) | gateway release triggered; `payouts.status = RELEASED`, `released_at` set — order stays `PICKED_UP`, **not yet** `COMPLETED` |
+| `PICKED_UP` (post-release) | Gateway confirms settlement (webhook) | `COMPLETED` | system (webhook) | `payouts.status = SETTLED`, `settled_at` set; `PayoutProcessed` event → notify farmer. If settlement fails instead (e.g. bad IFSC), `payouts.status = FAILED` and admin is alerted — order stays `PICKED_UP` pending manual resolution |
 | `CONFIRMED` / `PICKUP_SCHEDULED` | Mutual cancel or admin override | `CANCELLED` | farmer+retailer agreement, or admin | held transfer cancelled (never settled); payment refunded to retailer; reason logged |
 | `READY_FOR_PICKUP` | Pickup deadline passes with no `PICKED_UP` | `DISPUTED` (category `NO_SHOW`) | system (scheduled job) | auto-opens a dispute rather than silently cancelling — the transfer is already held, so a human decides whether/how to release, reduce, or reverse it |
-| `CONFIRMED`..`PICKED_UP` (before `payout_release_at`) | Either party raises a dispute (within the allowed window) | `DISPUTED` | farmer or retailer | scheduled release job is paused for this order; admin notified |
+| `CONFIRMED`..`PICKED_UP` (before settlement is confirmed) | Either party raises a dispute (within the allowed window) | `DISPUTED` | farmer or retailer | scheduled release job is paused for this order; admin notified. **Provider caveat**: if the transfer has already been released but not yet settled, reversal is confirmed to work on Razorpay (against the linked account's still-held balance) but is unconfirmed on Cashfree — see `provider-capabilities-payment-split.md` §4 |
 | `DISPUTED` | Admin resolves: no issue found | back to prior stage (`READY_FOR_PICKUP` if pre-pickup, `PICKED_UP` if post-pickup, with `payout_release_at` recomputed) | admin | resumes normal flow |
-| `DISPUTED` | Admin resolves: full refund | `REFUNDED` | admin | held transfer reversed via gateway API (funds never left platform's/gateway's control); payment refunded to retailer |
-| `DISPUTED` | Admin resolves: partial refund | `PARTIALLY_REFUNDED` → `COMPLETED` (after its own hold window) | admin | transfer amount reduced via gateway API; payment partially refunded to retailer; reduced transfer still goes through its own hold window before release |
+| `DISPUTED` | Admin resolves: full refund | `REFUNDED` | admin | held transfer reversed via gateway API; payment refunded to retailer |
+| `DISPUTED` | Admin resolves: partial refund | `PARTIALLY_REFUNDED` → `COMPLETED` (after its own hold window and settlement confirmation) | admin | transfer amount reduced via gateway API; payment partially refunded to retailer; reduced transfer still goes through its own hold window and release→settle sequence |
 
 ### Why no post-completion disputes
 
-Under this model, `COMPLETED` is defined as "the transfer has been released" — an action we deliberately can't
-undo through the gateway (that's what makes the trust guarantee meaningful in the other direction: a farmer who
-reaches `COMPLETED` has a real, final payout, not a conditional one forever). So V1 does not model a
-post-completion dispute/refund path. In exchange, the hold window (default 48h from pickup confirmation) is the
-real dispute deadline, and it needs to be long enough that this is rarely a problem in practice — the hold
-window length is admin-configurable specifically so it can be tuned from real data. A genuinely late-discovered
-issue after `COMPLETED` is a support/goodwill matter handled outside this state machine (e.g. a manual credit on
-a future order), not a system-modeled refund — this is a deliberate V1 limitation, not an oversight.
+Under this model, `COMPLETED` is defined as "the gateway has confirmed the transfer settled" — the point past
+which we deliberately don't try to undo anything (that's what makes the trust guarantee meaningful in the other
+direction: a farmer who reaches `COMPLETED` has a real, confirmed, final payout, not a conditional one forever).
+So V1 does not model a post-completion dispute/refund path. In exchange, the hold window (default 48h from
+pickup confirmation, plus whatever the release→settlement gap turns out to be in practice — see
+`provider-capabilities-payment-split.md` §6) is the real dispute deadline, and it needs to be long enough that
+this is rarely a problem in practice — the hold window length is admin-configurable specifically so it can be
+tuned from real data. A genuinely late-discovered issue after `COMPLETED` is a support/goodwill matter handled
+outside this state machine (e.g. a manual credit on a future order), not a system-modeled refund — this is a
+deliberate V1 limitation, not an oversight.
+
+**Cashfree-specific limit, if that provider is chosen**: its hold cannot be extended past a ceiling set at
+creation time (45 days maximum, no exceptions). An order approaching that ceiling with an unresolved dispute
+needs to be forced to a resolution *before* the ceiling, or Cashfree will settle it out from under the dispute
+regardless of what our own state machine says — see ADR-0005 §7 and `provider-capabilities-payment-split.md`
+§8.4. Razorpay has no equivalent ceiling.
 
 ### Notes
 
@@ -133,9 +148,10 @@ a future order), not a system-modeled refund — this is a deliberate V1 limitat
   `commission_rules` never affects an order already in progress — the amount printed to the retailer at checkout
   is the amount that's actually charged and settled.
 - **The payout transfer is created (on hold) at `PENDING_PAYMENT` and never released before `PICKED_UP` plus the
-  full hold window.** This is the core trust guarantee of the marketplace: a retailer who never shows up hasn't
-  had a farmer paid for nothing (the held transfer just gets cancelled), and a farmer who confirms pickup has a
-  payout that will definitely release unless a dispute is raised within the window — not an indefinite maybe.
+  full hold window, and the order doesn't count as `COMPLETED` until the gateway confirms settlement on top of
+  that.** This is the core trust guarantee of the marketplace: a retailer who never shows up hasn't had a farmer
+  paid for nothing (the held transfer just gets cancelled), and a farmer who confirms pickup has a payout that
+  will definitely settle unless a dispute is raised within the window — not an indefinite maybe.
 - **Cancellation policy (who can cancel when, any penalty) is deliberately left as an admin-configurable rule,
   not hardcoded** — see `docs/decisions/ADR-0004-cancellation-refund-policy.md`. The state machine above supports
   cancellation at any pre-pickup state; the *business rule* for whether that's free, partially penalized, etc.

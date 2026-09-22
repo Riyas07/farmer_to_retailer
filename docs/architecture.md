@@ -138,15 +138,23 @@ interface PaymentGatewayProvider {
 
   // Split payment: creates a gateway "order" with an on-hold transfer routing payoutAmount to the farmer's
   // linked account. The commission share is implicitly what's retained by the platform's own account.
-  createSplitPayment(input: SplitPaymentInput): Promise<{ providerOrderId: string; clientPayload: unknown }>;
+  // holdCeiling: the outer bound we're willing to commit to up front. Required for the Cashfree adapter
+  // (maps to settlementEligibilityDate/max_eligibity_date, hard-capped by the provider at 45 days — see
+  // docs/decisions/provider-capabilities-payment-split.md §3); the Razorpay adapter can ignore it or use it
+  // as an initial on_hold_until, since Razorpay has no real ceiling and lets us extend later anyway.
+  createSplitPayment(input: SplitPaymentInput & { holdCeiling: Date }): Promise<{ providerOrderId: string; clientPayload: unknown }>;
 
   verifyWebhookSignature(rawBody: Buffer, signature: string): boolean;
   parseWebhookEvent(rawBody: Buffer): PaymentWebhookEvent;
 
   // Transfer lifecycle — all act on the held transfer created by createSplitPayment, never on a new payout.
+  // releaseTransfer only TRIGGERS release — it does not itself mean the farmer has been paid. Both candidate
+  // providers confirm a separate, later settlement signal (see provider-capabilities-payment-split.md §6);
+  // callers must wait for parseWebhookEvent to report a settlement-confirmed event before treating the payout
+  // as final. Confirmed reliable on Razorpay; Cashfree's exact mechanism/event names are unconfirmed — §9.
   releaseTransfer(providerTransferId: string): Promise<TransferResult>;
-  reduceTransfer(providerTransferId: string, newAmount: number): Promise<TransferResult>; // partial refund
-  reverseTransfer(providerTransferId: string): Promise<TransferResult>; // full refund
+  reduceTransfer(providerTransferId: string, newAmount: number): Promise<TransferResult>; // partial refund — Razorpay confirmed, Cashfree unconfirmed (§4)
+  reverseTransfer(providerTransferId: string): Promise<TransferResult>; // full refund — Razorpay confirmed, Cashfree unconfirmed (§4)
 
   refundPayment(providerPaymentId: string, amount: number): Promise<RefundResult>;
 }
@@ -173,13 +181,17 @@ interface NotificationChannel {
 ```
 
 V1 bindings: `MockSmsProvider` (writes codes to a `sms_log` table + server console — nothing sent),
-`MockPaymentGatewayProvider` (simulates linked-account creation as instantly `ACTIVE`, simulates split-payment
-creation with a real `on_hold` transfer record, and exposes a test endpoint to "capture" payment and separately
-to "release"/"reduce"/"reverse" the transfer — so the hold-window/dispute logic in `orders` is fully exercisable
-without a real gateway account), `S3StorageProvider` (real — S3 is cheap and gives us real pre-signed upload URLs
-from day one, no reason to mock), `GeoProvider` with haversine + a simple rounding/grid-snap for
-`toDisplayPoint` (no Maps API key needed for V1), `MockNotificationChannel` (logs to a table, surfaced in admin
-for now instead of an actual push/SMS/email send).
+`MockPaymentGatewayProvider` — deliberately simulates the *harder* of the two real providers' behavior, not the
+easier one, per `docs/decisions/provider-capabilities-payment-split.md` §8: linked-account creation with a
+configurable activation delay (default instant, but overridable per test), split-payment creation that respects
+`holdCeiling`, a **two-phase** release with a configurable `RELEASED → SETTLED` lag (default a few seconds in
+dev, configurable up to realistic values for testing the "released but not yet settled" dispute-race edge case),
+an auto-release-at-ceiling behavior mirroring Cashfree's 45-day cap (scaled down for testing), and
+reduce/reverse calls that can be made to fail on demand — so the whole hold-window, settlement-gate, and
+ceiling-alert logic in `orders` is exercisable long before a real gateway account exists. `S3StorageProvider`
+(real — S3 is cheap and gives us real pre-signed upload URLs from day one, no reason to mock), `GeoProvider` with
+haversine + a simple rounding/grid-snap for `toDisplayPoint` (no Maps API key needed for V1),
+`MockNotificationChannel` (logs to a table, surfaced in admin for now instead of an actual push/SMS/email send).
 
 ## 6. Frontend
 

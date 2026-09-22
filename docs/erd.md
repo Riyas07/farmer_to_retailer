@@ -270,6 +270,12 @@ Raw webhook audit log — never trust a webhook you can't replay/inspect later.
 alongside the payment at `PENDING_PAYMENT` with `on_hold = true`, released only per the order state machine's
 hold-window logic.
 
+**Two-phase settlement, per provider research** (see
+`docs/decisions/provider-capabilities-payment-split.md`): "released" (hold lifted / `on_hold: false` sent) and
+"settled" (funds confirmed in the farmer's actual bank) are two different, confirmed-separate moments for both
+Razorpay and Cashfree — `orders.status` only becomes `COMPLETED` on the *settled* signal, not the release
+trigger. This is a correction from an earlier draft that treated them as one step.
+
 | column | type | notes |
 |---|---|---|
 | order_id | uuid, unique FK → orders | |
@@ -279,15 +285,17 @@ hold-window logic.
 | linked_account_id | text | copy of `farmer_profiles.gateway_linked_account_id` **at transfer creation time** — deliberately denormalized so a later change to the farmer's linked account never retroactively alters a historical transfer's record |
 | amount | numeric(12,2) | = `orders.payout_amount` at creation |
 | on_hold | boolean, default true | |
-| hold_release_at | timestamptz | mirrors `orders.payout_release_at` |
-| released_at | timestamptz, nullable | set when the gateway confirms release |
-| reversed_amount | numeric(12,2), default 0 | cumulative — set on dispute-driven reversal/reduction, always happens pre-release |
+| hold_release_at | timestamptz | mirrors `orders.payout_release_at` — the date we *intend* to release |
+| hold_ceiling_at | timestamptz, nullable | the outer bound communicated to the provider at creation (Cashfree: required — `settlementEligibilityDate` can only move earlier than this, never later, and the provider hard-caps it at 45 days out; Razorpay: no real ceiling, field kept for a provider-neutral schema — see ADR-0005 §7) |
+| released_at | timestamptz, nullable | set when the gateway confirms the **release trigger** (hold lifted) — not yet proof of funds landing |
+| settled_at | timestamptz, nullable | set when the gateway confirms funds actually reached the farmer's linked-account bank/UPI (Razorpay: `settlement.processed`-equivalent; Cashfree: equivalent TBD — see provider-capabilities doc §6/§9). `orders.status` moves to `COMPLETED` on this, not on `released_at` |
+| reversed_amount | numeric(12,2), default 0 | cumulative — set on dispute-driven reversal/reduction; confirmed possible pre-release on Razorpay, mechanism unconfirmed on Cashfree (see provider-capabilities doc §4) |
 | fee_amount | numeric(12,2), nullable | gateway's transfer fee, if any |
-| utr | text, nullable | bank UTR once the transfer settles from the linked account to the farmer's bank/UPI, if the gateway surfaces it |
-| status | enum(`ON_HOLD`,`RELEASED`,`REVERSED`,`PARTIALLY_REVERSED`,`FAILED`) | |
+| utr | text, nullable | bank UTR once settled, if the gateway surfaces it |
+| status | enum(`ON_HOLD`,`RELEASED`,`SETTLED`,`REVERSED`,`PARTIALLY_REVERSED`,`FAILED`) | `RELEASED` and `SETTLED` are now distinct — see above |
 | reconciliation_status | enum(`UNRECONCILED`,`RECONCILED`,`MISMATCH`), default `UNRECONCILED` | |
 | reconciled_at | timestamptz, nullable | |
-| failure_reason | text, nullable | |
+| failure_reason | text, nullable | covers both release failures and, separately, a settlement that fails after release (e.g. bad IFSC) |
 
 ### `disputes`
 
@@ -357,3 +365,6 @@ who hasn't actually transacted with that farmer. The rule, enforced at the API-s
   `docs/order-state-machine.md` for why: it keeps the auth OTP system and the pickup-confirmation system
   structurally incapable of being confused with each other, rather than relying on everyone remembering to
   filter by `purpose` correctly forever.
+- **`payouts.status` has both `RELEASED` and `SETTLED`, deliberately** — see the table note above and
+  `docs/decisions/provider-capabilities-payment-split.md`. This isn't schema over-engineering; both candidate
+  providers confirm these are genuinely separate events with a real gap between them.

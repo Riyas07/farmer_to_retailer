@@ -13,7 +13,10 @@ machine** for review. Implementation starts only after these are approved. See:
 - [`docs/erd.md`](./docs/erd.md) — data model (ERD + table definitions)
 - [`docs/api-spec.md`](./docs/api-spec.md) — REST API catalogue (+ [`docs/openapi.yaml`](./docs/openapi.yaml) starter)
 - [`docs/order-state-machine.md`](./docs/order-state-machine.md) — negotiation & order lifecycles
-- [`docs/decisions/`](./docs/decisions/) — ADRs for the specific calls worth a deliberate decision
+- [`docs/decisions/`](./docs/decisions/) — ADRs for the specific calls worth a deliberate decision, including
+  [`provider-capabilities-payment-split.md`](./docs/decisions/provider-capabilities-payment-split.md) — sourced
+  research on what Razorpay Route and Cashfree Easy Split actually support (hold/release/reversal/refund/
+  webhooks), with open items flagged for direct provider confirmation before the payment gateway is built
 
 ## Planned repo layout
 
