@@ -38,7 +38,10 @@ docs/
 3. Marketplace — categories, listings, image upload, search/matching
 4. Negotiation — offer/counter-offer thread, negotiation state machine
 5. Orders — order creation, order state machine, pickup scheduling/confirmation
-6. Payments — commission engine, payment intents (mock gateway), payout on pickup confirmation
+6. Payments — commission engine; split-payment creation with a held (`on_hold`) transfer to the farmer's linked
+   account (mock gateway); the held transfer is released only after pickup is confirmed *and* a hold window
+   passes with no open dispute, and the order isn't `COMPLETED` until the gateway separately confirms settlement
+   — see `docs/order-state-machine.md` and `docs/decisions/ADR-0005-payment-payout-model.md`
 7. Disputes — raise/track/resolve, refund/adjustment actions
 8. Notifications — domain events → notification log, in-app notification center
 9. Admin dashboards — verification queue, listing moderation, commission config, dispute queue, metrics

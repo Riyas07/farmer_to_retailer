@@ -51,13 +51,37 @@ Created the instant a negotiation is `ACCEPTED`. This is the core trust-and-mone
 actually landed in the farmer's bank) are two distinct, separately-signalled events for both Razorpay and
 Cashfree, with a real gap between them (Razorpay: "by the next working day"). An earlier draft of this doc
 treated them as one atomic step — corrected here. Because `COMPLETED` means "genuinely, confirmed paid,"
-`DISPUTED` must always be reachable *before* `COMPLETED` and never after. The mechanism: pickup confirmation does
-not itself release the transfer. It starts a hold window (`orders.payout_release_at`); once that window elapses
-with no dispute open, the system triggers release, and once the gateway *confirms settlement* (a later, separate
-signal — see `payouts.released_at` vs. `payouts.settled_at` in `docs/erd.md`), the order moves to `COMPLETED`.
-`DISPUTED` is reachable any time up through settlement confirmation, and is **not** reachable from `COMPLETED`.
-This narrows, but — per the provider research — does not fully eliminate, the residual window between release
-and settlement; that's an accepted, named risk, not a solved one.
+`DISPUTED` must always be reachable *before* `COMPLETED` and never after.
+
+**`PICKED_UP` therefore has two internal sub-phases, named after `payouts.status` directly so the diagram and
+the schema use the same vocabulary — this is not a new `orders.status` value, just a clearer way of talking
+about what's true while `orders.status` is `PICKED_UP`:**
+
+- **`payout_on_hold`** (`payouts.status = ON_HOLD`) — from pickup confirmation until the hold window
+  (`orders.payout_release_at`) elapses with no dispute open. The transfer is fully held at the gateway; nothing
+  has moved.
+- **`payout_released`** (`payouts.status = RELEASED`) — from the moment release is triggered until the gateway
+  confirms settlement. The transfer has been released *at the gateway*, but the money is sitting in the
+  farmer's linked/vendor account's own gateway-side balance, not yet paid out to their real bank — that's a
+  *third*, gateway-internal settlement lag on top of our own hold window (Razorpay: "by the next working day").
+
+**A dispute raised in each sub-phase has a materially different risk profile, and the design deliberately keeps
+`DISPUTED` reachable from both rather than only from `payout_on_hold`:**
+
+- **Dispute during `payout_on_hold`** — the routine, low-risk case. Nothing has been released; the scheduled
+  release job is simply paused/cancelled for this order, and resolution (reverse/reduce/no-action) acts on funds
+  that are provably still fully within the platform's held transfer.
+- **Dispute during `payout_released`** — a narrower, higher-risk case, and one this design accepts rather than
+  claims to fully close. Reversing money that's already been released means reclaiming it from the linked/vendor
+  account's own gateway balance *before that account's own settlement schedule pays it out for real*. Razorpay's
+  reversal API is confirmed to work against a linked account's balance (see the research doc §4); whether the
+  same is true after the linked account's *own* settlement has already run is unconfirmed, and Cashfree has no
+  confirmed reversal mechanism for an already-created split at all. A dispute landing in this window should be
+  treated by admin ops as **urgent and escalated**, not routine — see the transition table below.
+
+Once the gateway *confirms settlement* (`payouts.status: RELEASED → SETTLED`), the order moves to `COMPLETED`,
+and `DISPUTED` is **not** reachable from `COMPLETED` — by that point the money has definitively left the
+system's control, so there is nothing left to reverse.
 
 ```mermaid
 stateDiagram-v2
@@ -70,8 +94,12 @@ stateDiagram-v2
     CONFIRMED --> PICKUP_SCHEDULED: pickup date/time agreed
     PICKUP_SCHEDULED --> READY_FOR_PICKUP: farmer marks produce ready\n(pickup handover code generated)
     READY_FOR_PICKUP --> PICKED_UP: retailer confirms handover code\npayout_release_at = now + hold window (e.g. 48h)
-    PICKED_UP --> PICKED_UP: hold window elapses, no open dispute\ntransfer release triggered (payouts.status = RELEASED)
-    PICKED_UP --> COMPLETED: gateway confirms settlement\n(payouts.status = SETTLED)
+
+    state PICKED_UP {
+        [*] --> payout_on_hold
+        payout_on_hold --> payout_released: payout_release_at elapses, no open dispute\ntransfer release triggered\n(payouts.status: ON_HOLD -> RELEASED)
+    }
+    PICKED_UP --> COMPLETED: gateway confirms settlement\n(payouts.status: RELEASED -> SETTLED)
 
     CONFIRMED --> CANCELLED: mutual cancel / admin override (pre-pickup)\ntransfer cancelled, payment refunded
     PICKUP_SCHEDULED --> CANCELLED: mutual cancel / admin override (pre-pickup)\ntransfer cancelled, payment refunded
@@ -79,15 +107,16 @@ stateDiagram-v2
     CONFIRMED --> DISPUTED: dispute raised
     PICKUP_SCHEDULED --> DISPUTED: dispute raised
     READY_FOR_PICKUP --> DISPUTED: no-show past pickup deadline (system) or dispute raised
-    PICKED_UP --> DISPUTED: dispute raised (reachable until settlement is confirmed — see note above)
+    payout_on_hold --> DISPUTED: dispute raised BEFORE release\nLOW RISK: funds fully held, release job paused
+    payout_released --> DISPUTED: dispute raised AFTER release, BEFORE settlement\nHIGHER RISK: reclaims from linked/vendor account's own gateway balance\nbefore ITS OWN settlement pays it out for real - escalate immediately
 
     DISPUTED --> RESOLVED_RESUME: admin resolves — no action, resume flow
     DISPUTED --> REFUNDED: admin resolves — full refund; transfer reversed, payment refunded
     DISPUTED --> PARTIALLY_REFUNDED: admin resolves — partial refund; transfer reduced, payment partially refunded
 
     RESOLVED_RESUME --> READY_FOR_PICKUP: if dispute was raised pre-pickup
-    RESOLVED_RESUME --> PICKED_UP: if dispute was raised post-pickup, pre-release\n(payout_release_at recomputed from resolution time)
-    PARTIALLY_REFUNDED --> COMPLETED: reduced transfer released once its own hold window elapses
+    RESOLVED_RESUME --> PICKED_UP: if dispute was raised post-pickup\n(payout_release_at recomputed from resolution time;\nre-enters payout_on_hold regardless of which sub-phase the dispute interrupted)
+    PARTIALLY_REFUNDED --> COMPLETED: reduced transfer released once its own hold window elapses and settles
 
     CANCELLED --> [*]
     REFUNDED --> [*]
@@ -113,13 +142,14 @@ path in V1 — see the "why no post-completion disputes" note below.
 | `PENDING_PAYMENT` | Gateway webhook: payment captured | `CONFIRMED` | system (webhook) | `payments.status = CAPTURED`; `OrderConfirmed` event → notify both sides |
 | `CONFIRMED` | Pickup slot agreed | `PICKUP_SCHEDULED` | farmer or retailer (either proposes, other confirms — simple mutual-agreement field, not a sub-workflow) | `pickup_scheduled_at` set; notify both |
 | `PICKUP_SCHEDULED` | Farmer marks ready | `READY_FOR_PICKUP` | farmer | system generates a **pickup handover code** (`pickup_handover_codes` — a mechanism entirely separate from login/signup OTP, see below) and sends the plaintext code to the **farmer only**; notify retailer "ready for pickup" |
-| `READY_FOR_PICKUP` | Retailer enters the handover code (read aloud by farmer at physical handover) | `PICKED_UP` | retailer | `pickup_confirmed_at` set; `payout_release_at = pickup_confirmed_at + hold window` (default 48h, admin-configurable); `order_status_history` records who confirmed; `PickupConfirmed` event |
-| `PICKED_UP` | `payout_release_at` passes, no open dispute | `PICKED_UP` (unchanged) | system (scheduled job) | gateway release triggered; `payouts.status = RELEASED`, `released_at` set — order stays `PICKED_UP`, **not yet** `COMPLETED` |
-| `PICKED_UP` (post-release) | Gateway confirms settlement (webhook) | `COMPLETED` | system (webhook) | `payouts.status = SETTLED`, `settled_at` set; `PayoutProcessed` event → notify farmer. If settlement fails instead (e.g. bad IFSC), `payouts.status = FAILED` and admin is alerted — order stays `PICKED_UP` pending manual resolution |
+| `READY_FOR_PICKUP` | Retailer enters the handover code (read aloud by farmer at physical handover) | `PICKED_UP` (`payout_on_hold`) | retailer | `pickup_confirmed_at` set; `payout_release_at = pickup_confirmed_at + hold window` (default 48h, admin-configurable); `order_status_history` records who confirmed; `PickupConfirmed` event |
+| `PICKED_UP` (`payout_on_hold`) | `payout_release_at` passes, no open dispute | `PICKED_UP` (`payout_released`) | system (scheduled job) | gateway release triggered; `payouts.status: ON_HOLD → RELEASED`, `released_at` set — `orders.status` stays `PICKED_UP`, **not yet** `COMPLETED` |
+| `PICKED_UP` (`payout_released`) | Gateway confirms settlement (webhook) | `COMPLETED` | system (webhook) | `payouts.status: RELEASED → SETTLED`, `settled_at` set; `PayoutProcessed` event → notify farmer. If settlement fails instead (e.g. bad IFSC), `payouts.status = FAILED` and admin is alerted — order stays `PICKED_UP` (`payout_released`) pending manual resolution |
 | `CONFIRMED` / `PICKUP_SCHEDULED` | Mutual cancel or admin override | `CANCELLED` | farmer+retailer agreement, or admin | held transfer cancelled (never settled); payment refunded to retailer; reason logged |
 | `READY_FOR_PICKUP` | Pickup deadline passes with no `PICKED_UP` | `DISPUTED` (category `NO_SHOW`) | system (scheduled job) | auto-opens a dispute rather than silently cancelling — the transfer is already held, so a human decides whether/how to release, reduce, or reverse it |
-| `CONFIRMED`..`PICKED_UP` (before settlement is confirmed) | Either party raises a dispute (within the allowed window) | `DISPUTED` | farmer or retailer | scheduled release job is paused for this order; admin notified. **Provider caveat**: if the transfer has already been released but not yet settled, reversal is confirmed to work on Razorpay (against the linked account's still-held balance) but is unconfirmed on Cashfree — see `provider-capabilities-payment-split.md` §4 |
-| `DISPUTED` | Admin resolves: no issue found | back to prior stage (`READY_FOR_PICKUP` if pre-pickup, `PICKED_UP` if post-pickup, with `payout_release_at` recomputed) | admin | resumes normal flow |
+| `PICKED_UP` (`payout_on_hold`) | Either party raises a dispute | `DISPUTED` | farmer or retailer | **Routine case.** Scheduled release job is paused/cancelled for this order; admin notified at normal priority. Funds are fully held at the gateway — reversal/reduction acts on the still-intact held transfer |
+| `PICKED_UP` (`payout_released`) | Either party raises a dispute | `DISPUTED` | farmer or retailer | **Escalated case — admin notified as urgent, not routine.** Release has already been triggered; funds sit in the linked/vendor account's own gateway balance, pending *that account's own* settlement to the farmer's real bank. Reversal against this balance is confirmed to work on Razorpay (requires the linked account to still hold sufficient balance) but is **unconfirmed on Cashfree** — see `provider-capabilities-payment-split.md` §4. This is the one sub-case where resolution isn't guaranteed to succeed cleanly, and it should be treated that way operationally |
+| `DISPUTED` | Admin resolves: no issue found | back to prior stage (`READY_FOR_PICKUP` if pre-pickup, `PICKED_UP`/`payout_on_hold` if post-pickup, with `payout_release_at` recomputed) | admin | resumes normal flow |
 | `DISPUTED` | Admin resolves: full refund | `REFUNDED` | admin | held transfer reversed via gateway API; payment refunded to retailer |
 | `DISPUTED` | Admin resolves: partial refund | `PARTIALLY_REFUNDED` → `COMPLETED` (after its own hold window and settlement confirmation) | admin | transfer amount reduced via gateway API; payment partially refunded to retailer; reduced transfer still goes through its own hold window and release→settle sequence |
 
