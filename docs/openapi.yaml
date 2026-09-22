@@ -76,6 +76,9 @@ paths:
     get:
       tags: [catalog]
       summary: Search/browse active listings (matching engine)
+      description: >
+        Location-privacy: each item exposes displayLat/displayLng (coarse, ~1km) only — never the farmer's
+        exact pickupAddress/pickupLat/pickupLng. See docs/erd.md §3.
       parameters:
         - { name: categoryId, in: query, schema: { type: string, format: uuid } }
         - { name: cropName, in: query, schema: { type: string } }
@@ -88,7 +91,7 @@ paths:
         - { name: page, in: query, schema: { type: integer, default: 1 } }
       responses:
         "200":
-          description: Paginated listings
+          description: Paginated listings (public view — coarse location only)
           content:
             application/json:
               schema:
@@ -96,7 +99,7 @@ paths:
                 properties:
                   items:
                     type: array
-                    items: { $ref: "#/components/schemas/Listing" }
+                    items: { $ref: "#/components/schemas/ListingPublic" }
                   total: { type: integer }
                   page: { type: integer }
     post:
@@ -175,7 +178,10 @@ paths:
   /orders/{id}/pickup/confirm:
     post:
       tags: [orders]
-      summary: Retailer confirms handover using the OTP the farmer read out
+      summary: Retailer confirms handover using the pickup handover code the farmer read out
+      description: >
+        Verifies against pickup_handover_codes, NOT the login/signup otp_challenges table — this is a
+        structurally separate mechanism (see docs/architecture.md §5.1) and never issues an auth token.
       security: [{ bearerAuth: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
@@ -185,12 +191,14 @@ paths:
           application/json:
             schema:
               type: object
-              required: [otp]
+              required: [code]
               properties:
-                otp: { type: string }
+                code: { type: string }
       responses:
         "200":
-          description: Order moved to PICKED_UP; payout initiated
+          description: >
+            Order moved to PICKED_UP. payoutReleaseAt is set to now + the hold window; the held transfer
+            is NOT released yet — that happens once the hold window elapses with no open dispute.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Order" }
@@ -281,8 +289,12 @@ components:
         harvestDate: { type: string, format: date }
         availableFrom: { type: string, format: date-time }
         availableUntil: { type: string, format: date-time }
-        pickupAddress: { type: string }
+        pickupAddress:
+          type: string
+          description: Exact address, provided by the farmer. Never echoed back by any public/browse response.
 
+    # Full record, exact location included — only ever returned to the owning farmer (e.g. their own listing
+    # management views), never through a public/browse endpoint.
     Listing:
       allOf:
         - $ref: "#/components/schemas/CreateListingDto"
@@ -292,6 +304,27 @@ components:
             farmerId: { type: string, format: uuid }
             status: { type: string, enum: [DRAFT, ACTIVE, PAUSED, SOLD_OUT, EXPIRED, REMOVED] }
             createdAt: { type: string, format: date-time }
+
+    # Public/browse + negotiation view — coarse location only. This is what GET /listings and GET
+    # /listings/:id actually return. See docs/erd.md §3.
+    ListingPublic:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        farmerId: { type: string, format: uuid }
+        cropName: { type: string }
+        variety: { type: string }
+        quantityAvailable: { type: number }
+        unit: { type: string, enum: [KG, QUINTAL, DOZEN, UNIT] }
+        pricePerUnit: { type: number }
+        qualityGrade: { type: string, enum: [A, B, C] }
+        harvestDate: { type: string, format: date }
+        displayLat: { type: number, description: "Coarse (~1km) — never the exact pickup point" }
+        displayLng: { type: number }
+        village: { type: string }
+        district: { type: string }
+        status: { type: string, enum: [DRAFT, ACTIVE, PAUSED, SOLD_OUT, EXPIRED, REMOVED] }
+        createdAt: { type: string, format: date-time }
 
     Negotiation:
       type: object
@@ -306,6 +339,9 @@ components:
 
     Order:
       type: object
+      description: >
+        Only ever returned to this order's two participants (or an admin) — this is the one place the exact
+        pickupAddress/pickupLat/pickupLng are exposed. See docs/erd.md §3.
       properties:
         id: { type: string, format: uuid }
         negotiationId: { type: string, format: uuid }
@@ -324,8 +360,29 @@ components:
               READY_FOR_PICKUP, PICKED_UP, COMPLETED, CANCELLED, DISPUTED,
               REFUNDED, PARTIALLY_REFUNDED,
             ]
+        pickupAddress: { type: string }
+        pickupLat: { type: number }
+        pickupLng: { type: number }
         pickupScheduledAt: { type: string, format: date-time, nullable: true }
         pickupConfirmedAt: { type: string, format: date-time, nullable: true }
+        payoutReleaseAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set at pickup confirmation = pickupConfirmedAt + hold window. The held transfer releases (order becomes COMPLETED) only once this passes with no open dispute.
+
+    Payout:
+      type: object
+      description: The gateway's held split-transfer record for this order's farmer share. See ADR-0005.
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        amount: { type: number }
+        onHold: { type: boolean }
+        holdReleaseAt: { type: string, format: date-time, nullable: true }
+        releasedAt: { type: string, format: date-time, nullable: true }
+        reversedAmount: { type: number }
+        status: { type: string, enum: [ON_HOLD, RELEASED, REVERSED, PARTIALLY_REVERSED, FAILED] }
 
     Dispute:
       type: object

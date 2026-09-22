@@ -28,3 +28,9 @@ we're just not building the rule evaluator until there's evidence of what the ru
 - Every dispute needs an admin to look at it — fine at MVP volume, would need revisiting well before this
   becomes a bottleneck (i.e. before dispute volume is more than an admin can review same-day).
 - `docs/admin` metrics should include "open disputes older than 24h" so this doesn't silently pile up.
+- **This interacts with the payout hold window (ADR-0005 / `order-state-machine.md`).** A dispute opened on an
+  order in `PICKED_UP` pauses that order's scheduled transfer release, so there's no hard deadline forcing a
+  same-day resolution *for that specific order*. But once an admin resolves it back to `RESOLVED_RESUME`, the
+  hold window restarts — so a resolved-but-then-reopened dispute, or a genuinely slow admin, can still push an
+  order's effective payout date out. Worth watching once real dispute volume shows up, but not something V1
+  needs to solve pre-emptively.

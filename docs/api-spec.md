@@ -21,6 +21,10 @@ Standard error shape for every 4xx/5xx:
 | POST | `/auth/logout` | bearer | — | `204` |
 
 Rate limits: max 3 OTP requests per phone per 10 minutes; max 5 verify attempts per challenge before it's dead.
+`purpose` here is strictly `SIGNUP`/`LOGIN` — this endpoint has no notion of pickup handover at all. The pickup
+handover code is a completely separate mechanism under `/orders/:id/mark-ready` and `/orders/:id/pickup/confirm`
+(see the Orders section) — verifying it can never yield an auth token, and these auth endpoints can never verify
+a pickup code. See `docs/architecture.md` §5.1.
 
 ## Users / profiles
 
@@ -29,17 +33,18 @@ Rate limits: max 3 OTP requests per phone per 10 minutes; max 5 verify attempts 
 | GET | `/users/me` | bearer | — | user + role-specific profile |
 | PATCH | `/farmer/profile` | bearer, role `FARMER` | partial `FarmerProfile` | updated profile |
 | PATCH | `/retailer/profile` | bearer, role `RETAILER` | partial `RetailerProfile` | updated profile |
-| POST | `/farmer/profile/payout-details` | bearer, `FARMER` | `{ payoutMethod, upiVpa? , bankAccountNumber?, bankIfsc? }` | `204` |
 | GET | `/users/me/notifications` | bearer | query: `unreadOnly?` | `Notification[]` |
 | PATCH | `/users/me/notifications/:id/read` | bearer | — | `204` |
+| POST | `/farmer/payout-account` | bearer, `FARMER` | `{ ...gateway-required KYC fields }` | `{ linkedAccountId, status }` — starts gateway linked-account onboarding (see ADR-0005); required before this farmer's first order can be confirmed, not before they can list |
+| GET | `/farmer/payout-account` | bearer, `FARMER` | — | `{ linkedAccountId, status }` |
 
 ## Catalog / listings
 
 | Method | Path | Auth | Body / Query | Response |
 |---|---|---|---|---|
 | GET | `/categories` | none | — | `Category[]` |
-| GET | `/listings` | none (public browse) | query: `categoryId?, cropName?, minPrice?, maxPrice?, lat?, lng?, radiusKm?, minQuantity?, sort?(distance\|price\|newest), page?, pageSize?` | `{ items: Listing[], total, page }` — routed through the `matching` service |
-| GET | `/listings/:id` | none | — | `Listing` (with images, farmer's public display name/village) |
+| GET | `/listings` | none (public browse) | query: `categoryId?, cropName?, minPrice?, maxPrice?, lat?, lng?, radiusKm?, minQuantity?, sort?(distance\|price\|newest), page?, pageSize?` | `{ items: Listing[], total, page }` — routed through the `matching` service. **Location privacy**: each `Listing` exposes `displayLat`/`displayLng` (coarse, ~1km) and `village`/`district` text only — `pickupAddress`/exact `pickupLat`/`pickupLng` are never included in this response, see `docs/erd.md` §3 |
+| GET | `/listings/:id` | none | — | `Listing` (with images, farmer's public display name/village) — same coarse-location-only rule as above |
 | POST | `/listings` | bearer, `FARMER` (verified) | `CreateListingDto` | `Listing` |
 | PATCH | `/listings/:id` | bearer, owning `FARMER` | partial `UpdateListingDto` | `Listing` |
 | DELETE | `/listings/:id` | bearer, owning `FARMER` | — | `204` (soft: `status = REMOVED`) |
@@ -53,7 +58,7 @@ Rate limits: max 3 OTP requests per phone per 10 minutes; max 5 verify attempts 
 |---|---|---|---|---|
 | POST | `/listings/:id/negotiations` | bearer, `RETAILER` | `{ pricePerUnit, quantity, message? }` | `Negotiation` |
 | GET | `/negotiations` | bearer | query: `status?` | `Negotiation[]` (mine, either side) |
-| GET | `/negotiations/:id` | bearer, participant | — | `Negotiation` with `offers: NegotiationOffer[]` |
+| GET | `/negotiations/:id` | bearer, participant | — | `Negotiation` with `offers: NegotiationOffer[]` — still coarse-location-only; exact pickup address isn't revealed until an order exists |
 | POST | `/negotiations/:id/offers` | bearer, participant | `{ pricePerUnit, quantity, message? }` | `NegotiationOffer` |
 | POST | `/negotiations/:id/accept` | bearer, participant | — | `Negotiation` (status `ACCEPTED`) → triggers order creation |
 | POST | `/negotiations/:id/reject` | bearer, participant | `{ reason? }` | `Negotiation` |
@@ -67,28 +72,30 @@ your own open offer).
 | Method | Path | Auth | Body | Response |
 |---|---|---|---|---|
 | GET | `/orders` | bearer | query: `status?, role?` | `Order[]` (mine, either side) |
-| GET | `/orders/:id` | bearer, participant | — | `Order` (with `payment`, `payout` summaries) |
+| GET | `/orders/:id` | bearer, participant | — | `Order` (with `payment`, `payout` summaries). **This is the only place `pickupAddress`/exact `pickupLat`/`pickupLng` are ever returned, and only to this order's own farmer/retailer (or an admin)** |
 | POST | `/orders/:id/schedule-pickup` | bearer, participant | `{ scheduledAt }` | `Order` (status `PICKUP_SCHEDULED`) |
-| POST | `/orders/:id/mark-ready` | bearer, owning `FARMER` | — | `Order` (status `READY_FOR_PICKUP`) — server generates & SMS's the handover OTP to the farmer |
-| POST | `/orders/:id/pickup/confirm` | bearer, `RETAILER` | `{ otp }` | `Order` (status `PICKED_UP`) |
-| POST | `/orders/:id/cancel` | bearer, participant or `ADMIN` | `{ reason }` | `Order` (status `CANCELLED`) |
+| POST | `/orders/:id/mark-ready` | bearer, owning `FARMER` | — | `Order` (status `READY_FOR_PICKUP`) — server generates a **pickup handover code** (`pickup_handover_codes`, order-scoped — not the login OTP system, see `docs/architecture.md` §5.1) and sends it to the farmer only |
+| POST | `/orders/:id/pickup/regenerate-code` | bearer, owning `FARMER` | — | `204` — invalidates the current handover code and issues a fresh one, e.g. if it expired or was lost |
+| POST | `/orders/:id/pickup/confirm` | bearer, `RETAILER` | `{ code }` | `Order` (status `PICKED_UP`; `payoutReleaseAt` set to now + hold window) |
+| POST | `/orders/:id/cancel` | bearer, participant or `ADMIN` | `{ reason }` | `Order` (status `CANCELLED`) — only valid before `CONFIRMED`→pickup states per the state machine; the held transfer is cancelled, never settled |
 
 ## Payments
 
 | Method | Path | Auth | Body | Response |
 |---|---|---|---|---|
-| POST | `/orders/:id/payment-intent` | bearer, owning `RETAILER` | — | `{ provider, providerPaymentIntentId, clientPayload }` (gateway-specific checkout payload) |
-| GET | `/orders/:id/payment` | bearer, participant | — | `Payment` |
+| POST | `/orders/:id/payment-intent` | bearer, owning `RETAILER` | — | `{ provider, providerOrderId, clientPayload }` — creates the gateway's split-payment order with the farmer's `on_hold` transfer already configured for `payoutAmount` (see ADR-0005); `clientPayload` is what the frontend hands to the gateway's checkout SDK |
+| GET | `/orders/:id/payment` | bearer, participant | — | `Payment` (includes reconciliation fields for admin; participant view omits internal reconciliation status) |
+| GET | `/orders/:id/payout` | bearer, participant | — | `Payout` — the held-transfer record: `onHold`, `holdReleaseAt`, `status`, and (once released) `releasedAt` |
 | POST | `/webhooks/payments/:provider` | **none** (HMAC signature verified from raw body) | raw gateway payload | `200` (always, per gateway convention) |
 
 ## Disputes
 
 | Method | Path | Auth | Body | Response |
 |---|---|---|---|---|
-| POST | `/orders/:id/disputes` | bearer, participant | `{ category, description, evidenceS3Keys? }` | `Dispute` |
+| POST | `/orders/:id/disputes` | bearer, participant | `{ category, description, evidenceS3Keys? }` | `Dispute` — only accepted while the order is in a pre-`COMPLETED` state and (if past `PICKED_UP`) before `payoutReleaseAt`; rejected with `409 DISPUTE_WINDOW_CLOSED` otherwise, since `COMPLETED` means the transfer has already, irreversibly, released (see `order-state-machine.md`) |
 | GET | `/disputes` | bearer | query: `status?` | `Dispute[]` (mine, or all if `ADMIN`) |
 | GET | `/disputes/:id` | bearer, participant or `ADMIN` | — | `Dispute` |
-| POST | `/admin/disputes/:id/resolve` | bearer, `ADMIN` | `{ resolution: NO_ACTION\|REFUND\|PARTIAL_REFUND, refundAmount?, notes }` | `Dispute` + updated `Order` |
+| POST | `/admin/disputes/:id/resolve` | bearer, `ADMIN` | `{ resolution: NO_ACTION\|REFUND\|PARTIAL_REFUND, refundAmount?, notes }` | `Dispute` + updated `Order` — `REFUND` reverses the held transfer and refunds the payment; `PARTIAL_REFUND` reduces the held transfer and partially refunds the payment; both act on funds still held pre-release, never a clawback |
 
 ## Admin
 
@@ -105,6 +112,7 @@ your own open offer).
 | PATCH | `/admin/commission-rules/:id` | bearer, `ADMIN` | `{ effectiveTo }` | `CommissionRule` (ends a rule; rules are immutable otherwise — create a new one to change a rate) |
 | GET | `/admin/metrics/overview` | bearer, `ADMIN` | query: `from?, to?` | `{ gmv, commissionEarned, activeFarmers, activeRetailers, ordersByStatus }` |
 | GET | `/admin/audit-logs` | bearer, `ADMIN` | query: `entityType?, entityId?` | `AuditLog[]` |
+| GET | `/admin/reconciliation/mismatches` | bearer, `ADMIN` | query: `type?(payment\|payout), from?, to?` | `{ payments: Payment[], payouts: Payout[] }` — everything with `reconciliationStatus = MISMATCH`, i.e. our record disagrees with the gateway's settlement report |
 
 ## Conventions
 

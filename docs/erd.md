@@ -25,11 +25,12 @@ erDiagram
     NEGOTIATIONS |o--o| ORDERS : "becomes (if ACCEPTED)"
 
     ORDERS ||--o{ ORDER_STATUS_HISTORY : logs
+    ORDERS ||--o| PICKUP_HANDOVER_CODES : "has one active"
     ORDERS ||--o| COMMISSION_LEDGER : "has one"
     COMMISSION_RULES ||--o{ COMMISSION_LEDGER : "applied as"
     ORDERS ||--o| PAYMENTS : "has one"
     PAYMENTS ||--o{ PAYMENT_EVENTS : "webhook log"
-    ORDERS ||--o| PAYOUTS : "has one"
+    ORDERS ||--o| PAYOUTS : "has one held transfer"
     ORDERS ||--o{ DISPUTES : "may have"
 
     USERS ||--o{ NOTIFICATIONS : receives
@@ -49,13 +50,15 @@ Core identity for every actor (farmer, retailer, admin). Phone number is the log
 | last_login_at | timestamptz, nullable | |
 
 ### `otp_challenges`
-Every OTP request/verify attempt — never store the OTP in plaintext.
+**Login/signup only.** Every OTP request/verify attempt for authentication — never store the OTP in plaintext.
+This table is deliberately *not* used for pickup handover (see `pickup_handover_codes` below) — the two are
+structurally separate so a code generated for one purpose can never be used for the other.
 
 | column | type | notes |
 |---|---|---|
 | user_id | uuid, nullable FK → users | null when OTP is for signup (user doesn't exist yet) |
 | phone_e164 | text, not null | |
-| purpose | enum(`SIGNUP`,`LOGIN`,`PICKUP_CONFIRM`) | pickup confirmation reuses the OTP mechanism (see order-state-machine.md) |
+| purpose | enum(`SIGNUP`,`LOGIN`) | narrowed to auth only — see `pickup_handover_codes` for the handover flow |
 | otp_hash | text, not null | bcrypt/argon2 hash, never plaintext |
 | attempts | smallint, default 0 | max 5, then challenge is dead |
 | expires_at | timestamptz, not null | 5 minutes from creation |
@@ -69,13 +72,16 @@ Every OTP request/verify attempt — never store the OTP in plaintext.
 | user_id | uuid, unique FK → users | |
 | full_name | text | |
 | village, district, state, pincode | text | |
-| lat, lng | double precision | for matching/distance |
-| payout_method | enum(`UPI`,`BANK`) | |
-| upi_vpa | text, nullable | |
-| bank_account_number_enc, bank_ifsc | text, nullable | encrypted at rest |
-| verification_status | enum(`UNVERIFIED`,`PENDING`,`VERIFIED`,`REJECTED`) | admin-gated before a farmer can list |
+| lat, lng | double precision | exact farm location — used server-side for distance calc and to derive `listings.display_lat/lng`; never returned directly by a public API (see §3) |
+| gateway_linked_account_id | text, nullable | the payment gateway's linked/sub-account id (Razorpay Route / Cashfree Easy Split) — required before this farmer can receive a payout, not before they can list or negotiate |
+| gateway_linked_account_status | enum(`NOT_STARTED`,`PENDING`,`ACTIVE`,`REJECTED`) | gateway-side KYC status, independent of our own `verification_status` below |
+| verification_status | enum(`UNVERIFIED`,`PENDING`,`VERIFIED`,`REJECTED`) | our own admin-gated verification, required before a farmer can list |
 | verified_by_admin_id | uuid, nullable FK → users | |
 | verified_at | timestamptz, nullable | |
+
+*(The old `payout_method`/`upi_vpa`/`bank_account_number_enc`/`bank_ifsc` fields from the collect-then-payout
+draft are removed — under the gateway marketplace/split model, bank/UPI details are collected and held by the
+gateway as part of the farmer's linked-account onboarding, not stored by us. See ADR-0005.)*
 
 ### `retailer_profiles`
 1:1 with `users` where `role = RETAILER`.
@@ -113,7 +119,9 @@ A farmer's sellable batch of produce.
 | quality_grade | enum(`A`,`B`,`C`), nullable | |
 | harvest_date | date, nullable | |
 | available_from, available_until | timestamptz | availability window |
-| pickup_address, pickup_lat, pickup_lng | text / double precision | defaults to farmer's location, editable per listing |
+| pickup_address | text | **exact** address — access-restricted, see §3. Defaults from the farmer's profile, editable per listing |
+| pickup_lat, pickup_lng | double precision | **exact** coordinates — access-restricted, see §3 |
+| display_lat, display_lng | double precision | **coarse** coordinates derived server-side from `pickup_lat/lng` (rounded to ~2 decimal degrees, roughly a 1km jitter/grid-snap) — this is what public/browse APIs and the matching engine's distance sort actually return |
 | status | enum(`DRAFT`,`ACTIVE`,`PAUSED`,`SOLD_OUT`,`EXPIRED`,`REMOVED`) | |
 
 ### `listing_images`
@@ -161,13 +169,31 @@ Created only from an `ACCEPTED` negotiation — 1:1 with it.
 | subtotal_amount | numeric(12,2) | `quantity * price_per_unit` |
 | commission_rate_snapshot | numeric(6,3) | % or flat, snapshotted at confirmation — see `commission_rules` |
 | commission_amount | numeric(12,2) | computed once, immutable after |
-| payout_amount | numeric(12,2) | `subtotal_amount - commission_amount` |
+| payout_amount | numeric(12,2) | `subtotal_amount - commission_amount` — the amount configured on the held gateway transfer |
 | status | enum — see order-state-machine.md | |
-| pickup_address, pickup_lat, pickup_lng | | copied from listing, editable |
+| pickup_address | text | **exact** — copied from the listing at order creation; returned only to the two participants (see §3) |
+| pickup_lat, pickup_lng | double precision | **exact** — same access restriction |
 | pickup_scheduled_at | timestamptz, nullable | |
 | pickup_confirmed_at | timestamptz, nullable | |
-| pickup_otp_hash | text, nullable | shared handover OTP — see below |
+| payout_release_at | timestamptz, nullable | set at pickup confirmation = `pickup_confirmed_at + hold window` (default 48h, admin-configurable); the scheduled release job acts on this — see order-state-machine.md |
 | cancelled_reason, cancelled_by | text / uuid, nullable | |
+
+*(`pickup_otp_hash` from the earlier draft is removed — replaced by the dedicated `pickup_handover_codes` table
+below.)*
+
+### `pickup_handover_codes`
+**New — separate from `otp_challenges` on purpose.** One row per generated handover code, scoped to a specific
+order, not a phone number. Verifying one only ever transitions order state; it never issues an auth token.
+
+| column | type | notes |
+|---|---|---|
+| order_id | uuid FK → orders | |
+| code_hash | text, not null | hashed, never stored/logged in plaintext |
+| attempts | smallint, default 0 | max 5 per active code |
+| expires_at | timestamptz | independent TTL from login OTP — can be longer, since a farmer may mark ready hours before actual handover |
+| generated_at | timestamptz | |
+| confirmed_at | timestamptz, nullable | set when the retailer successfully verifies it |
+| regenerated_count | smallint, default 0 | farmer can request a fresh code if the original expires or is lost; increments this and invalidates the previous code |
 
 ### `order_status_history`
 Append-only audit trail of every state transition — required for disputes and support.
@@ -176,7 +202,7 @@ Append-only audit trail of every state transition — required for disputes and 
 |---|---|---|
 | order_id | uuid FK → orders | |
 | from_status, to_status | enum | |
-| changed_by_user_id | uuid, nullable FK → users | null = system-initiated (e.g. webhook, expiry job) |
+| changed_by_user_id | uuid, nullable FK → users | null = system-initiated (e.g. webhook, expiry job, scheduled payout release) |
 | reason | text, nullable | |
 
 ### `commission_rules`
@@ -203,15 +229,29 @@ if `commission_rules` changes later.
 | amount | numeric(12,2) | = `orders.commission_amount` |
 
 ### `payments`
-1:1 with `orders`. The retailer's payment into the platform.
+1:1 with `orders`. The retailer's payment, created as a split payment with an on-hold transfer to the farmer
+(see ADR-0005). Reconciliation fields strengthened so a finance review never has to go to the gateway dashboard
+to answer "did this actually settle, and for how much."
 
 | column | type | notes |
 |---|---|---|
 | order_id | uuid, unique FK → orders | |
 | provider | enum(`MOCK`,`RAZORPAY`,`CASHFREE`) | |
-| provider_payment_intent_id | text | gateway's order/intent id |
-| amount, currency | numeric / text | currency default `INR` |
+| provider_order_id | text | gateway's "order" object id — created at `PENDING_PAYMENT`, carries the `transfers[]`/split spec |
+| provider_payment_id | text, nullable | the actual payment/transaction id, set once the retailer pays |
+| method | enum(`UPI`,`CARD`,`NETBANKING`,`WALLET`,`OTHER`), nullable | populated from the gateway's response on capture |
+| currency | text, default `INR` | |
+| authorized_amount | numeric(12,2), nullable | |
+| captured_amount | numeric(12,2), nullable | |
+| fee_amount | numeric(12,2), nullable | gateway's fee on this payment |
+| tax_amount | numeric(12,2), nullable | GST on the gateway fee |
+| net_amount | numeric(12,2), nullable | `captured_amount - fee_amount - tax_amount` — what actually lands in the platform's settlement for its commission share |
+| refunded_amount | numeric(12,2), default 0 | cumulative — supports multiple partial refunds |
+| settlement_id | text, nullable | gateway's settlement batch id, once it lands |
+| settlement_utr | text, nullable | bank UTR for the settlement — the field finance actually reconciles against |
 | status | enum(`CREATED`,`AUTHORIZED`,`CAPTURED`,`FAILED`,`REFUNDED`,`PARTIALLY_REFUNDED`) | |
+| reconciliation_status | enum(`UNRECONCILED`,`RECONCILED`,`MISMATCH`), default `UNRECONCILED` | set by a reconciliation job comparing our records to the gateway's settlement report |
+| reconciled_at | timestamptz, nullable | |
 | captured_at | timestamptz, nullable | |
 | failure_reason | text, nullable | |
 
@@ -226,18 +266,28 @@ Raw webhook audit log — never trust a webhook you can't replay/inspect later.
 | received_at | timestamptz | |
 
 ### `payouts`
-1:1 with `orders`. Platform → farmer, triggered only after pickup confirmation.
+1:1 with `orders`. Represents the gateway's held **split transfer** to the farmer's linked account — created
+alongside the payment at `PENDING_PAYMENT` with `on_hold = true`, released only per the order state machine's
+hold-window logic.
 
 | column | type | notes |
 |---|---|---|
 | order_id | uuid, unique FK → orders | |
 | farmer_id | uuid FK → farmer_profiles | |
 | provider | enum(`MOCK`,`RAZORPAY`,`CASHFREE`) | |
-| provider_payout_id | text, nullable | |
-| amount | numeric(12,2) | = `orders.payout_amount` |
-| status | enum(`PENDING`,`PROCESSING`,`SETTLED`,`FAILED`) | |
+| provider_transfer_id | text | the gateway's Route/Split transfer id |
+| linked_account_id | text | copy of `farmer_profiles.gateway_linked_account_id` **at transfer creation time** — deliberately denormalized so a later change to the farmer's linked account never retroactively alters a historical transfer's record |
+| amount | numeric(12,2) | = `orders.payout_amount` at creation |
+| on_hold | boolean, default true | |
+| hold_release_at | timestamptz | mirrors `orders.payout_release_at` |
+| released_at | timestamptz, nullable | set when the gateway confirms release |
+| reversed_amount | numeric(12,2), default 0 | cumulative — set on dispute-driven reversal/reduction, always happens pre-release |
+| fee_amount | numeric(12,2), nullable | gateway's transfer fee, if any |
+| utr | text, nullable | bank UTR once the transfer settles from the linked account to the farmer's bank/UPI, if the gateway surfaces it |
+| status | enum(`ON_HOLD`,`RELEASED`,`REVERSED`,`PARTIALLY_REVERSED`,`FAILED`) | |
+| reconciliation_status | enum(`UNRECONCILED`,`RECONCILED`,`MISMATCH`), default `UNRECONCILED` | |
+| reconciled_at | timestamptz, nullable | |
 | failure_reason | text, nullable | |
-| initiated_at, settled_at | timestamptz | |
 
 ### `disputes`
 
@@ -277,7 +327,25 @@ General admin/system action trail (verification decisions, dispute resolutions, 
 | entity_type, entity_id | text / uuid | polymorphic reference |
 | before, after | jsonb, nullable | state diff where useful |
 
-## 3. Notes on a few deliberate choices
+## 3. Location-privacy boundary (exact vs. coarse)
+
+A farmer's exact pickup location is meaningful personal/safety information and must not be exposed to anyone
+who hasn't actually transacted with that farmer. The rule, enforced at the API-serializer level (see
+`docs/api-spec.md`):
+
+- **Public/browse endpoints** (`GET /listings`, `GET /listings/:id`) and **negotiation endpoints**
+  (`GET /negotiations`, `GET /negotiations/:id`) serialize `listings.display_lat`/`display_lng` (coarse, ~1km) —
+  and a village/district text label — **never** `pickup_address`/`pickup_lat`/`pickup_lng`.
+- **`orders.pickup_address`/`pickup_lat`/`pickup_lng`** (copied from the listing at order-creation time) are
+  serialized **only** by `GET /orders/:id`, and only to that order's two participants (the specific farmer and
+  retailer) or an admin — never to any other authenticated user, and never unauthenticated.
+- This means a retailer only learns a farmer's exact pickup location once they've actually committed to a deal
+  (negotiation accepted → order created), not while merely browsing or negotiating. That's an intentional
+  trust/safety tradeoff, not an oversight — it costs the retailer nothing (they still get accurate
+  distance/sorting via `display_lat/lng` during browse), while meaningfully reducing exposure of a farmer's home
+  or farm location to anonymous or not-yet-committed users.
+
+## 4. Notes on a few other deliberate choices
 
 - **No `admin_profiles` table** — an admin is just a `users` row with `role = ADMIN`. Fine-grained permission
   tiers can be added later if/when the admin team grows past "founder + a couple of ops people."
@@ -285,6 +353,7 @@ General admin/system action trail (verification decisions, dispute resolutions, 
   looks redundant but isn't: the columns on `orders` make the hot-path order queries fast (no join needed to show
   a farmer their payout), while `commission_ledger` is the accounting-grade record tied to the rule that produced
   it, for admin reporting and audits.
-- **Pickup handover OTP lives on `orders.pickup_otp_hash`**, reusing the same OTP mechanism as login rather than
-  inventing a second one — see `docs/order-state-machine.md` for how it's used to confirm handover without any
-  logistics/delivery infrastructure.
+- **Pickup handover uses its own table (`pickup_handover_codes`), not `otp_challenges`** — see §2 and
+  `docs/order-state-machine.md` for why: it keeps the auth OTP system and the pickup-confirmation system
+  structurally incapable of being confused with each other, rather than relying on everyone remembering to
+  filter by `purpose` correctly forever.

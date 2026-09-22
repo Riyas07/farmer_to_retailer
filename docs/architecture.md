@@ -11,9 +11,12 @@ wholesalers) operating in India. The platform is a **facilitator, not a merchant
 
 - It never takes ownership of goods.
 - It earns revenue via a **commission** on completed transactions, computed and enforced server-side.
-- Payment is collected from the retailer through a payment gateway, held by the platform, and **paid out to the
-  farmer (minus commission) only after pickup is confirmed by both parties** — this gives the marketplace an
-  escrow-like trust mechanism without needing to run logistics.
+- Payment is collected from the retailer through the payment gateway's own **marketplace/split-payment product**
+  (Razorpay Route / Cashfree Easy Split style), which routes the farmer's share to their own linked account as a
+  **held transfer** — never into the platform's own bank account — and **releases to the farmer only after
+  pickup is confirmed and a short dispute window has passed** — this gives the marketplace an escrow-like trust
+  mechanism without needing to run logistics, and without the platform ever taking custody of a transaction that
+  isn't its own. See `docs/decisions/ADR-0005-payment-payout-model.md`.
 - Fulfilment starts as **pickup-only** (farmer's location or an agreed point). Third-party delivery is an
   interface we design for but do not build in V1.
 
@@ -84,16 +87,16 @@ SQL/ORM queries.
 
 | Module | Responsibility |
 |---|---|
-| `auth` | OTP request/verify, JWT issuance & refresh, role guards, session/device tracking |
+| `auth` | Login/signup OTP request/verify (`otp_challenges`, purpose-restricted to `SIGNUP`/`LOGIN`), JWT issuance & refresh, role guards, session/device tracking. Structurally separate from the pickup handover code in `orders` — see below |
 | `users` | Core `User` identity, role (`FARMER` \| `RETAILER` \| `ADMIN`), profile completeness/KYC status |
 | `farmer-profile` | Farmer-specific data: farm location, bank/UPI payout details, verification status |
 | `retailer-profile` | Retailer-specific data: business name, business location, GSTIN (optional at MVP) |
-| `catalog` | Produce categories, units of measure, listings (crop, quantity, price/unit, quality grade, images, availability window) |
+| `catalog` | Produce categories, units of measure, listings (crop, quantity, price/unit, quality grade, images, availability window). Serializes only a **coarse** location (`display_lat`/`display_lng`) on every public/browse and negotiation-facing endpoint — the farmer's exact pickup address is never returned here, see §5.1 |
 | `matching` | Stateless query/scoring service: given a retailer's filters, rank active listings (distance, price, freshness) |
 | `negotiation` | Offer / counter-offer thread on a listing between one farmer and one retailer; negotiation state machine |
-| `orders` | Order creation from an accepted negotiation; order state machine; pickup scheduling & confirmation |
+| `orders` | Order creation from an accepted negotiation; order state machine, including the payout hold window; pickup scheduling & confirmation via its own **pickup handover code** (`pickup_handover_codes`, order-scoped, structurally separate from auth OTP — see §5.1); exposes the order's **exact** pickup address only to that order's two participants |
 | `commission` | Commission rule configuration (admin-managed); computes & snapshots commission on order confirmation; commission ledger |
-| `payments` | Payment intent creation, gateway webhook handling, payment status; payout initiation to farmer via provider interface |
+| `payments` | Split-payment creation with an on-hold farmer transfer, gateway webhook handling, payment status and reconciliation fields; releases/reduces/reverses the held transfer via the provider interface once the order state machine says to |
 | `disputes` | Raise/track/resolve disputes tied to an order; resolution actions (refund, partial refund, release, reject) |
 | `notifications` | Domain-event listener → fan-out to SMS/push/email via provider interface; per-user notification log |
 | `admin` | Cross-module read/write APIs for the admin dashboard: user verification, listing moderation, commission config, dispute queue, platform metrics |
@@ -109,16 +112,43 @@ a future extraction into a real message queue (SQS/SNS) would happen, without to
 All defined in `apps/api/src/providers/*` as TypeScript interfaces with DI tokens, so NestJS can bind a different
 implementation per environment via config, with zero call-site changes.
 
+### 5.1 Two structurally separate "code" mechanisms
+
+It's worth calling out explicitly, since it's easy to conflate: **login/signup OTP** (`auth` module,
+`otp_challenges` table, `SmsProvider`) and the **pickup handover code** (`orders` module,
+`pickup_handover_codes` table) share the same *shape* — a short hashed code with an expiry and attempt limit —
+but are otherwise independent systems. Different table, different endpoints, different TTL policy, and a pickup
+code is scoped to one `order_id` rather than a phone number. Verifying a pickup code never touches `auth` and
+never issues a token — it only calls into `orders`' own state-transition logic. This separation is deliberate:
+it makes it structurally impossible for a pickup code to be replayed as a login credential, rather than relying
+on every call site remembering to filter by a shared `purpose` column correctly.
+
 ```ts
 interface SmsProvider {
+  // used only by `auth` for login/signup OTP delivery
   sendOtp(phoneE164: string, otp: string): Promise<void>;
+  // used by `orders` to read the pickup handover code aloud to the farmer via SMS as a backup to in-app display
+  sendPickupCode(phoneE164: string, code: string, orderId: string): Promise<void>;
 }
 
 interface PaymentGatewayProvider {
-  createPaymentIntent(order: OrderPaymentInput): Promise<PaymentIntentResult>;
+  // Farmer onboarding — required before an order can be confirmed for that farmer, not before they can list.
+  createLinkedAccount(farmer: FarmerLinkedAccountInput): Promise<{ linkedAccountId: string; status: LinkedAccountStatus }>;
+  getLinkedAccountStatus(linkedAccountId: string): Promise<LinkedAccountStatus>;
+
+  // Split payment: creates a gateway "order" with an on-hold transfer routing payoutAmount to the farmer's
+  // linked account. The commission share is implicitly what's retained by the platform's own account.
+  createSplitPayment(input: SplitPaymentInput): Promise<{ providerOrderId: string; clientPayload: unknown }>;
+
   verifyWebhookSignature(rawBody: Buffer, signature: string): boolean;
   parseWebhookEvent(rawBody: Buffer): PaymentWebhookEvent;
-  initiatePayout(payout: PayoutInput): Promise<PayoutResult>;
+
+  // Transfer lifecycle — all act on the held transfer created by createSplitPayment, never on a new payout.
+  releaseTransfer(providerTransferId: string): Promise<TransferResult>;
+  reduceTransfer(providerTransferId: string, newAmount: number): Promise<TransferResult>; // partial refund
+  reverseTransfer(providerTransferId: string): Promise<TransferResult>; // full refund
+
+  refundPayment(providerPaymentId: string, amount: number): Promise<RefundResult>;
 }
 
 interface StorageProvider {
@@ -131,6 +161,9 @@ interface GeoProvider {
   // Real Maps use (geocoding a free-text address, autocomplete) is opt-in and deferred.
   distanceKm(a: LatLng, b: LatLng): number;
   geocode?(address: string): Promise<LatLng>;
+  // Derives the coarse point (docs/erd.md §3) stored as listings.display_lat/lng — a pure function, not
+  // actually a network call, but kept on this interface since it's conceptually part of "geo handling".
+  toDisplayPoint(exact: LatLng): LatLng;
 }
 
 interface NotificationChannel {
@@ -139,7 +172,14 @@ interface NotificationChannel {
 }
 ```
 
-V1 bindings: `MockSmsProvider` (writes OTP to a `sms_log` table + server console — nothing sent), `MockPaymentGatewayProvider` (simulates intent creation and lets a test endpoint "confirm" payment, simulates payouts as instantly `SETTLED`), `S3StorageProvider` (real — S3 is cheap and gives us real pre-signed upload URLs from day one, no reason to mock), `GeoProvider` with haversine only (no Maps API key needed for V1), `MockNotificationChannel` (logs to a table, surfaced in admin for now instead of an actual push/SMS/email send).
+V1 bindings: `MockSmsProvider` (writes codes to a `sms_log` table + server console — nothing sent),
+`MockPaymentGatewayProvider` (simulates linked-account creation as instantly `ACTIVE`, simulates split-payment
+creation with a real `on_hold` transfer record, and exposes a test endpoint to "capture" payment and separately
+to "release"/"reduce"/"reverse" the transfer — so the hold-window/dispute logic in `orders` is fully exercisable
+without a real gateway account), `S3StorageProvider` (real — S3 is cheap and gives us real pre-signed upload URLs
+from day one, no reason to mock), `GeoProvider` with haversine + a simple rounding/grid-snap for
+`toDisplayPoint` (no Maps API key needed for V1), `MockNotificationChannel` (logs to a table, surfaced in admin
+for now instead of an actual push/SMS/email send).
 
 ## 6. Frontend
 
