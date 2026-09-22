@@ -9,3 +9,11 @@ build/
 coverage/
 .turbo/
 .pnpm-store/
+
+# Prisma
+apps/api/generated/
+
+# Vite / build outputs
+apps/web/dist/
+apps/admin/dist/
+*.tsbuildinfo

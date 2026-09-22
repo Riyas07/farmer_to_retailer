@@ -1,0 +1,16 @@
+{
+  "name": "@farmer-to-retailer/shared-types",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Enums and base DTO shapes shared across apps/api, apps/web and apps/admin, kept in lockstep with docs/erd.md and docs/order-state-machine.md.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo \"(no lint configured yet for shared-types)\""
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}

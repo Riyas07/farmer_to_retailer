@@ -1,0 +1,686 @@
+// Data model for the Farmer-to-Retailer marketplace.
+//
+// Source of truth: docs/erd.md. This file is a direct, table-for-table translation of that approved
+// document — if the two ever disagree, docs/erd.md is correct and this file needs to be fixed, not the
+// other way around. See docs/order-state-machine.md for how `orders.status` and `negotiations.status`
+// actually transition (enforced in service code, not by this schema).
+//
+// Convention carried over from docs/erd.md: every table has `id uuid primary key default
+// gen_random_uuid()` (built into Postgres core since v13 — no pgcrypto extension needed),
+// `created_at timestamptz default now()`, and `updated_at timestamptz default now()`. Money columns are
+// `numeric(12,2)` in INR, modeled here as Decimal(12,2).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  FARMER
+  RETAILER
+  ADMIN
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+}
+
+/// otp_challenges.purpose — login/signup only. Never used for pickup handover, see PickupHandoverCode.
+enum OtpPurpose {
+  SIGNUP
+  LOGIN
+}
+
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// farmer_profiles.gateway_linked_account_status — the payment gateway's own KYC status, independent
+/// of VerificationStatus (our own admin-gated verification).
+enum LinkedAccountStatus {
+  NOT_STARTED
+  PENDING
+  ACTIVE
+  REJECTED
+}
+
+enum UnitOfMeasure {
+  KG
+  QUINTAL
+  DOZEN
+  UNIT
+}
+
+enum QualityGrade {
+  A
+  B
+  C
+}
+
+enum ListingStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  SOLD_OUT
+  EXPIRED
+  REMOVED
+}
+
+enum NegotiationStatus {
+  OPEN
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+/// Shared by negotiation_offers.sender_role and disputes.raised_by_role — both are exactly {FARMER, RETAILER}.
+enum PartyRole {
+  FARMER
+  RETAILER
+}
+
+/// orders.status — see docs/order-state-machine.md §2 for the full diagram and transition table.
+/// `PICKED_UP` has two sub-phases distinguished by `payouts.status` (ON_HOLD vs RELEASED), not by a
+/// separate value here. `RESOLVED_RESUME` from the diagram is deliberately not a stored value — the doc
+/// explicitly allows resolution to resume directly to the correct concrete state.
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAYMENT_FAILED
+  CONFIRMED
+  PICKUP_SCHEDULED
+  READY_FOR_PICKUP
+  PICKED_UP
+  DISPUTED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  COMPLETED
+  CANCELLED
+}
+
+enum CommissionRuleType {
+  PERCENTAGE
+  FLAT
+}
+
+/// Provider-neutral by design — see ADR-0005. No provider chosen yet between Razorpay and Cashfree.
+enum PaymentProvider {
+  MOCK
+  RAZORPAY
+  CASHFREE
+}
+
+enum PaymentMethod {
+  UPI
+  CARD
+  NETBANKING
+  WALLET
+  OTHER
+}
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+/// payouts.status — RELEASED and SETTLED are deliberately distinct, confirmed-separate events for both
+/// candidate providers (docs/decisions/provider-capabilities-payment-split.md). orders.status only
+/// reaches COMPLETED on SETTLED.
+enum PayoutStatus {
+  ON_HOLD
+  RELEASED
+  SETTLED
+  REVERSED
+  PARTIALLY_REVERSED
+  FAILED
+}
+
+enum ReconciliationStatus {
+  UNRECONCILED
+  RECONCILED
+  MISMATCH
+}
+
+enum DisputeCategory {
+  QUALITY
+  QUANTITY
+  NO_SHOW
+  PAYMENT
+  OTHER
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_REFUND
+  RESOLVED_PARTIAL_REFUND
+  RESOLVED_NO_ACTION
+  REJECTED
+}
+
+enum NotificationChannelType {
+  SMS
+  PUSH
+  EMAIL
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phoneE164    String     @unique @map("phone_e164")
+  role         UserRole
+  status       UserStatus @default(PENDING_VERIFICATION)
+  lastLoginAt  DateTime?  @map("last_login_at") @db.Timestamptz
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  farmerProfile      FarmerProfile?
+  retailerProfile    RetailerProfile?
+  otpChallenges      OtpChallenge[]              @relation("UserOtpChallenges")
+  notifications      Notification[]
+  auditLogsActed     AuditLog[]                  @relation("AuditLogActor")
+  farmerVerifications FarmerProfile[]            @relation("FarmerVerifiedBy")
+  retailerVerifications RetailerProfile[]        @relation("RetailerVerifiedBy")
+  orderStatusChanges OrderStatusHistory[]         @relation("OrderStatusChangedBy")
+  commissionRulesCreated CommissionRule[]         @relation("CommissionRuleCreatedBy")
+  disputesRaised     Dispute[]                    @relation("DisputeRaisedBy")
+  disputesResolved   Dispute[]                    @relation("DisputeResolvedBy")
+  ordersCancelled    Order[]                      @relation("OrderCancelledBy")
+
+  @@map("users")
+}
+
+/// Login/signup only — see docs/architecture.md §5.1. Structurally separate from PickupHandoverCode.
+model OtpChallenge {
+  id          String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String?    @map("user_id") @db.Uuid
+  phoneE164   String     @map("phone_e164")
+  purpose     OtpPurpose
+  otpHash     String     @map("otp_hash")
+  attempts    Int        @default(0) @db.SmallInt
+  expiresAt   DateTime   @map("expires_at") @db.Timestamptz
+  consumedAt  DateTime?  @map("consumed_at") @db.Timestamptz
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User? @relation("UserOtpChallenges", fields: [userId], references: [id])
+
+  @@index([phoneE164])
+  @@map("otp_challenges")
+}
+
+model FarmerProfile {
+  id                          String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                      String               @unique @map("user_id") @db.Uuid
+  fullName                    String               @map("full_name")
+  village                     String
+  district                    String
+  state                       String
+  pincode                     String
+  lat                         Float
+  lng                         Float
+  gatewayLinkedAccountId      String?              @map("gateway_linked_account_id")
+  gatewayLinkedAccountStatus  LinkedAccountStatus  @default(NOT_STARTED) @map("gateway_linked_account_status")
+  verificationStatus          VerificationStatus   @default(UNVERIFIED) @map("verification_status")
+  verifiedByAdminId           String?              @map("verified_by_admin_id") @db.Uuid
+  verifiedAt                  DateTime?            @map("verified_at") @db.Timestamptz
+  createdAt                   DateTime             @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt                   DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  user         User       @relation(fields: [userId], references: [id])
+  verifiedBy   User?      @relation("FarmerVerifiedBy", fields: [verifiedByAdminId], references: [id])
+  listings     Listing[]
+  negotiations Negotiation[]
+  orders       Order[]
+  payouts      Payout[]
+
+  @@map("farmer_profiles")
+}
+
+model RetailerProfile {
+  id                  String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String              @unique @map("user_id") @db.Uuid
+  businessName        String              @map("business_name")
+  contactName          String              @map("contact_name")
+  businessAddress     String              @map("business_address")
+  lat                 Float
+  lng                 Float
+  gstin               String?
+  verificationStatus  VerificationStatus  @default(UNVERIFIED) @map("verification_status")
+  verifiedByAdminId   String?             @map("verified_by_admin_id") @db.Uuid
+  verifiedAt          DateTime?           @map("verified_at") @db.Timestamptz
+  createdAt           DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  user         User          @relation(fields: [userId], references: [id])
+  verifiedBy   User?         @relation("RetailerVerifiedBy", fields: [verifiedByAdminId], references: [id])
+  negotiations Negotiation[]
+  orders       Order[]
+
+  @@map("retailer_profiles")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Category {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String         @unique
+  unitOfMeasure  UnitOfMeasure  @map("unit_of_measure")
+  isActive       Boolean        @default(true) @map("is_active")
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  listings        Listing[]
+  commissionRules CommissionRule[]
+
+  @@map("categories")
+}
+
+/// Location privacy boundary (docs/erd.md §3): `pickupAddress`/`pickupLat`/`pickupLng` are EXACT and
+/// access-restricted — never serialized by public/browse or negotiation endpoints. `displayLat`/`displayLng`
+/// are the coarse (~1km) points those endpoints actually return, derived server-side via GeoProvider.toDisplayPoint.
+model Listing {
+  id                 String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  farmerId           String         @map("farmer_id") @db.Uuid
+  categoryId         String         @map("category_id") @db.Uuid
+  cropName           String         @map("crop_name")
+  variety            String?
+  quantityAvailable  Decimal        @map("quantity_available") @db.Decimal(12, 2)
+  unit               UnitOfMeasure
+  pricePerUnit       Decimal        @map("price_per_unit") @db.Decimal(12, 2)
+  qualityGrade       QualityGrade?  @map("quality_grade")
+  harvestDate        DateTime?      @map("harvest_date") @db.Date
+  availableFrom      DateTime       @map("available_from") @db.Timestamptz
+  availableUntil     DateTime       @map("available_until") @db.Timestamptz
+  pickupAddress      String         @map("pickup_address")
+  pickupLat          Float          @map("pickup_lat")
+  pickupLng          Float          @map("pickup_lng")
+  displayLat         Float          @map("display_lat")
+  displayLng         Float          @map("display_lng")
+  status             ListingStatus  @default(DRAFT)
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  farmer       FarmerProfile   @relation(fields: [farmerId], references: [id])
+  category     Category        @relation(fields: [categoryId], references: [id])
+  images       ListingImage[]
+  negotiations Negotiation[]
+  orders       Order[]
+
+  @@index([farmerId])
+  @@index([categoryId])
+  @@index([status])
+  @@map("listings")
+}
+
+model ListingImage {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  listingId String   @map("listing_id") @db.Uuid
+  s3Key     String   @map("s3_key")
+  position  Int      @db.SmallInt
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  listing Listing @relation(fields: [listingId], references: [id])
+
+  @@index([listingId])
+  @@map("listing_images")
+}
+
+// ---------------------------------------------------------------------------
+// Negotiation
+// ---------------------------------------------------------------------------
+
+model Negotiation {
+  id                    String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  listingId             String            @map("listing_id") @db.Uuid
+  farmerId              String            @map("farmer_id") @db.Uuid
+  retailerId            String            @map("retailer_id") @db.Uuid
+  status                NegotiationStatus @default(OPEN)
+  initialPricePerUnit   Decimal           @map("initial_price_per_unit") @db.Decimal(12, 2)
+  initialQuantity       Decimal           @map("initial_quantity") @db.Decimal(12, 2)
+  finalPricePerUnit     Decimal?          @map("final_price_per_unit") @db.Decimal(12, 2)
+  finalQuantity         Decimal?          @map("final_quantity") @db.Decimal(12, 2)
+  expiresAt             DateTime          @map("expires_at") @db.Timestamptz
+  createdAt             DateTime          @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  listing  Listing              @relation(fields: [listingId], references: [id])
+  farmer   FarmerProfile        @relation(fields: [farmerId], references: [id])
+  retailer RetailerProfile      @relation(fields: [retailerId], references: [id])
+  offers   NegotiationOffer[]
+  order    Order?
+
+  @@index([listingId])
+  @@index([farmerId])
+  @@index([retailerId])
+  @@index([status])
+  @@map("negotiations")
+}
+
+/// Append-only thread — never updated, only inserted.
+model NegotiationOffer {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  negotiationId  String    @map("negotiation_id") @db.Uuid
+  senderRole     PartyRole @map("sender_role")
+  pricePerUnit   Decimal   @map("price_per_unit") @db.Decimal(12, 2)
+  quantity       Decimal   @db.Decimal(12, 2)
+  message        String?
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  negotiation Negotiation @relation(fields: [negotiationId], references: [id])
+
+  @@index([negotiationId])
+  @@map("negotiation_offers")
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+/// Created only from an ACCEPTED negotiation — 1:1 with it. See docs/order-state-machine.md for the
+/// full lifecycle this `status` column moves through.
+model Order {
+  id                        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  negotiationId             String       @unique @map("negotiation_id") @db.Uuid
+  listingId                 String       @map("listing_id") @db.Uuid
+  farmerId                  String       @map("farmer_id") @db.Uuid
+  retailerId                String       @map("retailer_id") @db.Uuid
+  quantity                  Decimal      @db.Decimal(12, 2)
+  pricePerUnit               Decimal      @map("price_per_unit") @db.Decimal(12, 2)
+  subtotalAmount            Decimal      @map("subtotal_amount") @db.Decimal(12, 2)
+  commissionRateSnapshot    Decimal      @map("commission_rate_snapshot") @db.Decimal(6, 3)
+  commissionAmount          Decimal      @map("commission_amount") @db.Decimal(12, 2)
+  payoutAmount              Decimal      @map("payout_amount") @db.Decimal(12, 2)
+  status                    OrderStatus  @default(PENDING_PAYMENT)
+  pickupAddress             String       @map("pickup_address")
+  pickupLat                 Float        @map("pickup_lat")
+  pickupLng                 Float        @map("pickup_lng")
+  pickupScheduledAt         DateTime?    @map("pickup_scheduled_at") @db.Timestamptz
+  pickupConfirmedAt         DateTime?    @map("pickup_confirmed_at") @db.Timestamptz
+  payoutReleaseAt           DateTime?    @map("payout_release_at") @db.Timestamptz
+  cancelledReason           String?      @map("cancelled_reason")
+  cancelledBy               String?      @map("cancelled_by") @db.Uuid
+  createdAt                 DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt                 DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  negotiation   Negotiation           @relation(fields: [negotiationId], references: [id])
+  listing       Listing               @relation(fields: [listingId], references: [id])
+  farmer        FarmerProfile         @relation(fields: [farmerId], references: [id])
+  retailer      RetailerProfile       @relation(fields: [retailerId], references: [id])
+  cancelledByUser User?               @relation("OrderCancelledBy", fields: [cancelledBy], references: [id])
+  statusHistory OrderStatusHistory[]
+  pickupHandoverCode PickupHandoverCode?
+  commissionLedger  CommissionLedger?
+  payment       Payment?
+  payout        Payout?
+  disputes      Dispute[]
+
+  @@index([farmerId])
+  @@index([retailerId])
+  @@index([status])
+  @@map("orders")
+}
+
+/// New, separate from OtpChallenge on purpose — see docs/architecture.md §5.1. One row per order,
+/// updated in place on regenerate (docs/erd.md: "has one active"). Verifying it only ever transitions
+/// order state; it never issues an auth token.
+model PickupHandoverCode {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId            String    @unique @map("order_id") @db.Uuid
+  codeHash           String    @map("code_hash")
+  attempts           Int       @default(0) @db.SmallInt
+  expiresAt          DateTime  @map("expires_at") @db.Timestamptz
+  generatedAt        DateTime  @map("generated_at") @db.Timestamptz
+  confirmedAt        DateTime? @map("confirmed_at") @db.Timestamptz
+  regeneratedCount   Int       @default(0) @map("regenerated_count") @db.SmallInt
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@map("pickup_handover_codes")
+}
+
+/// Append-only audit trail of every order state transition — required for disputes and support.
+model OrderStatusHistory {
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId         String       @map("order_id") @db.Uuid
+  fromStatus      OrderStatus? @map("from_status")
+  toStatus        OrderStatus  @map("to_status")
+  changedByUserId String?      @map("changed_by_user_id") @db.Uuid
+  reason          String?
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
+
+  order          Order  @relation(fields: [orderId], references: [id])
+  changedByUser  User?  @relation("OrderStatusChangedBy", fields: [changedByUserId], references: [id])
+
+  @@index([orderId])
+  @@map("order_status_history")
+}
+
+// ---------------------------------------------------------------------------
+// Commission
+// ---------------------------------------------------------------------------
+
+/// Admin-configured, resolved per category with a global (categoryId = null) fallback.
+model CommissionRule {
+  id                String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  categoryId        String?            @map("category_id") @db.Uuid
+  ruleType          CommissionRuleType @map("rule_type")
+  value             Decimal            @db.Decimal(6, 3)
+  minAmount         Decimal?           @map("min_amount") @db.Decimal(12, 2)
+  maxAmount         Decimal?           @map("max_amount") @db.Decimal(12, 2)
+  effectiveFrom     DateTime           @map("effective_from") @db.Timestamptz
+  effectiveTo       DateTime?          @map("effective_to") @db.Timestamptz
+  createdByAdminId  String             @map("created_by_admin_id") @db.Uuid
+  createdAt         DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  category      Category?        @relation(fields: [categoryId], references: [id])
+  createdByUser User              @relation("CommissionRuleCreatedBy", fields: [createdByAdminId], references: [id])
+  ledgerEntries CommissionLedger[]
+
+  @@index([categoryId])
+  @@map("commission_rules")
+}
+
+/// One row per order — a snapshot of which rule was applied, for accounting even if commission_rules changes later.
+model CommissionLedger {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId             String   @unique @map("order_id") @db.Uuid
+  commissionRuleId    String   @map("commission_rule_id") @db.Uuid
+  rateOrFlatApplied   Decimal  @map("rate_or_flat_applied") @db.Decimal(12, 3)
+  amount              Decimal  @db.Decimal(12, 2)
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  order          Order          @relation(fields: [orderId], references: [id])
+  commissionRule CommissionRule @relation(fields: [commissionRuleId], references: [id])
+
+  @@map("commission_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Payments & payouts
+// ---------------------------------------------------------------------------
+
+/// 1:1 with Order. The retailer's payment, created as a split payment with an on-hold transfer to the
+/// farmer (ADR-0005). Reconciliation fields per docs/erd.md so finance never has to check the gateway
+/// dashboard to answer "did this actually settle, and for how much."
+model Payment {
+  id                    String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId               String                @unique @map("order_id") @db.Uuid
+  provider              PaymentProvider
+  providerOrderId       String                @map("provider_order_id")
+  providerPaymentId     String?               @map("provider_payment_id")
+  method                PaymentMethod?
+  currency              String                @default("INR")
+  authorizedAmount      Decimal?              @map("authorized_amount") @db.Decimal(12, 2)
+  capturedAmount        Decimal?              @map("captured_amount") @db.Decimal(12, 2)
+  feeAmount             Decimal?              @map("fee_amount") @db.Decimal(12, 2)
+  taxAmount             Decimal?              @map("tax_amount") @db.Decimal(12, 2)
+  netAmount             Decimal?              @map("net_amount") @db.Decimal(12, 2)
+  refundedAmount        Decimal               @default(0) @map("refunded_amount") @db.Decimal(12, 2)
+  settlementId          String?               @map("settlement_id")
+  settlementUtr         String?               @map("settlement_utr")
+  status                PaymentStatus         @default(CREATED)
+  reconciliationStatus  ReconciliationStatus  @default(UNRECONCILED) @map("reconciliation_status")
+  reconciledAt          DateTime?             @map("reconciled_at") @db.Timestamptz
+  capturedAt            DateTime?             @map("captured_at") @db.Timestamptz
+  failureReason         String?               @map("failure_reason")
+  createdAt             DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime              @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  order  Order           @relation(fields: [orderId], references: [id])
+  events PaymentEvent[]
+
+  @@map("payments")
+}
+
+/// Raw webhook audit log — never trust a webhook you can't replay/inspect later.
+model PaymentEvent {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId   String   @map("payment_id") @db.Uuid
+  eventType   String   @map("event_type")
+  rawPayload  Json     @map("raw_payload")
+  receivedAt  DateTime @map("received_at") @db.Timestamptz
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+
+  @@index([paymentId])
+  @@map("payment_events")
+}
+
+/// 1:1 with Order. The gateway's held split transfer to the farmer's linked account. Two-phase
+/// settlement per provider research (docs/decisions/provider-capabilities-payment-split.md): RELEASED
+/// (hold lifted) and SETTLED (funds confirmed in the farmer's bank) are genuinely separate, confirmed
+/// events for both candidate providers — orders.status only reaches COMPLETED on SETTLED.
+model Payout {
+  id                    String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId               String                @unique @map("order_id") @db.Uuid
+  farmerId              String                @map("farmer_id") @db.Uuid
+  provider              PaymentProvider
+  providerTransferId    String                @map("provider_transfer_id")
+  linkedAccountId       String                @map("linked_account_id")
+  amount                Decimal               @db.Decimal(12, 2)
+  onHold                Boolean               @default(true) @map("on_hold")
+  holdReleaseAt         DateTime              @map("hold_release_at") @db.Timestamptz
+  holdCeilingAt         DateTime?             @map("hold_ceiling_at") @db.Timestamptz
+  releasedAt            DateTime?             @map("released_at") @db.Timestamptz
+  settledAt             DateTime?             @map("settled_at") @db.Timestamptz
+  reversedAmount        Decimal               @default(0) @map("reversed_amount") @db.Decimal(12, 2)
+  feeAmount             Decimal?              @map("fee_amount") @db.Decimal(12, 2)
+  utr                   String?
+  status                PayoutStatus          @default(ON_HOLD)
+  reconciliationStatus  ReconciliationStatus  @default(UNRECONCILED) @map("reconciliation_status")
+  reconciledAt          DateTime?             @map("reconciled_at") @db.Timestamptz
+  failureReason         String?               @map("failure_reason")
+  createdAt             DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime              @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  order  Order         @relation(fields: [orderId], references: [id])
+  farmer FarmerProfile @relation(fields: [farmerId], references: [id])
+
+  @@index([farmerId])
+  @@index([status])
+  @@map("payouts")
+}
+
+// ---------------------------------------------------------------------------
+// Disputes
+// ---------------------------------------------------------------------------
+
+model Dispute {
+  id                  String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId             String           @map("order_id") @db.Uuid
+  raisedByUserId      String           @map("raised_by_user_id") @db.Uuid
+  raisedByRole        PartyRole        @map("raised_by_role")
+  category            DisputeCategory
+  description         String
+  evidenceS3Keys      Json             @map("evidence_s3_keys")
+  status              DisputeStatus    @default(OPEN)
+  resolutionNotes     String?          @map("resolution_notes")
+  resolvedByAdminId   String?          @map("resolved_by_admin_id") @db.Uuid
+  resolvedAt          DateTime?        @map("resolved_at") @db.Timestamptz
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  order         Order @relation(fields: [orderId], references: [id])
+  raisedByUser  User  @relation("DisputeRaisedBy", fields: [raisedByUserId], references: [id])
+  resolvedByUser User? @relation("DisputeResolvedBy", fields: [resolvedByAdminId], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+  @@map("disputes")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications & audit
+// ---------------------------------------------------------------------------
+
+/// Per-user notification log — also the "outbox" the notification channels read from.
+model Notification {
+  id        String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String                  @map("user_id") @db.Uuid
+  type      String
+  title     String
+  body      String
+  data      Json
+  channel   NotificationChannelType
+  status    NotificationStatus      @default(PENDING)
+  readAt    DateTime?               @map("read_at") @db.Timestamptz
+  createdAt DateTime                @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("notifications")
+}
+
+/// General admin/system action trail (verification decisions, dispute resolutions, manual overrides).
+model AuditLog {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorUserId   String?  @map("actor_user_id") @db.Uuid
+  action        String
+  entityType    String   @map("entity_type")
+  entityId      String   @map("entity_id") @db.Uuid
+  before        Json?
+  after         Json?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  actorUser User? @relation("AuditLogActor", fields: [actorUserId], references: [id])
+
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}

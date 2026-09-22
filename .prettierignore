@@ -1,0 +1,7 @@
+# Approved design docs went through several review rounds with the user — Prettier reformatting them
+# is out of scope for the Foundation-phase infra scaffold and isn't something the user asked for.
+docs/
+README.md
+
+# Generated, never hand-formatted.
+pnpm-lock.yaml

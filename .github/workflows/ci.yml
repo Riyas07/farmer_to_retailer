@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  # Every external provider is mocked (docs/architecture.md §5) — CI needs no real vendor credentials.
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/farmer_to_retailer_test?schema=public
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: farmer_to_retailer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @farmer-to-retailer/api prisma:generate
+
+      - name: Validate Prisma schema
+        run: pnpm --filter @farmer-to-retailer/api prisma:validate
+
+      # No migrations are committed yet (prisma/migrations/ is empty) — the sandbox this scaffold was
+      # built in has no network access to binaries.prisma.sh, so `prisma migrate dev` could never be run
+      # to generate the initial migration. `db push` sanity-checks that schema.prisma is valid and
+      # actually applies to a real Postgres in the meantime. Swap this for `prisma migrate deploy` once
+      # an initial migration exists (see apps/api/README.md).
+      - name: Apply schema to the CI database (sanity check; swap for migrate deploy once migrations exist)
+        run: pnpm --filter @farmer-to-retailer/api exec prisma db push --accept-data-loss
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
