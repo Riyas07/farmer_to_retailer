@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import { HealthController } from "./health.controller.js";
 import { PrismaService } from "../prisma/prisma.service.js";
 
